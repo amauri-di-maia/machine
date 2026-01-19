@@ -1,0 +1,35 @@
+Weight band (g)	
+0g-70,00g = EUR 7,15
+70,01g-210,00g = EUR 8,30
+210,01g-430,00g = EUR 10,65
+430,01g-910,00g = EUR 14,75
+910,01-1840,00g = EUR 21,85
+1840,00g-3000g = EUR 27€
+
+ano de fabrico
+numero de sets 
+numeros de lojas 
+
+Ano de fabrico	Idade (2026)	
+1940 - 1975	🟥 Ultra Rara
+1976 – 1990	36 – 50	🟧 Rara
+1991 – 2005	21 – 35	🟨 Incomum
+2006 - 2026	🟩 Comum
+
+Nº de Sets que inclui a peça	
+50	🟥 Ultra Rara
+51-250	🟧 Rara
+251-750	🟨 Incomum
+750	🟩 Comum
+
+Nº de lojas no bricklink com a peça actualmente á venda
+1 – 5	🟥 Ultra Rara
+6 – 15	🟧 Rara
+16 – 50	🟨 Incomum
+> 50	🟩 Comum
+
+Stock disponível actualmente
+1 – 10	🟥 Ultra Rara
+11 – 25	🟧 Rara
+26 – 100🟨 Incomum
+> 100	🟩 Comum

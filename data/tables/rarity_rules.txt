@@ -1,0 +1,94 @@
+=============================
+Classificação de Raridade de Peças LEGO
+=============================
+
+Para atribuir corretamente a classificação de raridade de cada peça, devem ser considerados cuidadosamente os seguintes 5 fatores:
+
+1. Ano de fabrico
+2. Número de sets que incluem a peça
+3. Número de lojas no BrickLink que possuem a peça atualmente à venda
+4. Preço médio de venda nos últimos 6 meses
+5. Stock disponível atualmente no mercado
+
+---------------------------------
+1️⃣ Ano de fabrico
+---------------------------------
+1940 - 1975       🟥 Ultra Rara
+1976 - 1990       🟧 Rara
+1991 - 2005       🟨 Incomum
+2006 - 2026       🟩 Comum
+
+---------------------------------
+2️⃣ Número de sets que incluem a peça
+---------------------------------
+≤ 50              🟥 Ultra Rara
+51 – 250          🟧 Rara
+251 – 750         🟨 Incomum
+> 750             🟩 Comum
+
+---------------------------------
+3️⃣ Número de lojas no BrickLink com a peça atualmente à venda
+---------------------------------
+1 – 5             🟥 Ultra Rara
+6 – 15            🟧 Rara
+16 – 50           🟨 Incomum
+> 50              🟩 Comum
+
+---------------------------------
+4️⃣ Preço médio de venda nos últimos 6 meses
+---------------------------------
+≥ 25 USD          🟥 Ultra Rara
+11 – 25 USD       🟧 Rara
+2.5 – 10 USD      🟨 Incomum
+< 2.5 USD         🟩 Comum
+
+---------------------------------
+5️⃣ Stock disponível atualmente no mercado
+---------------------------------
+1 – 10            🟥 Ultra Rara
+11 – 25           🟧 Rara
+26 – 100          🟨 Incomum
+> 100             🟩 Comum
+
+---------------------------------
+Pontuação sugerida para cada categoria:
+- 🟥 Ultra Rara = 3
+- 🟧 Rara = 2
+- 🟨 Incomum = 1
+- 🟩 Comum = 0
+
+---------------------------------
+Pesos recomendados para cálculo de Rarity Index:
+- Ano de fabrico: 20%
+- Nº de sets: 25%
+- Nº de lojas: 20%
+- Preço médio: 15%
+- Stock disponível: 20%
+
+Rarity Index (0 a 3) = 
+(Score_Ano * 0.20) + 
+(Score_Sets * 0.25) + 
+(Score_Lojas * 0.20) + 
+(Score_Preço * 0.15) + 
+(Score_Stock * 0.20)
+
+---------------------------------
+Classificação final baseada no Rarity Index:
+- 2.5 – 3.0   → 🟥 Ultra Rara
+- 1.75 – 2.49 → 🟧 Rara
+- 1.0 – 1.74  → 🟨 Incomum
+- 0 – 0.99    → 🟩 Comum
+
+---------------------------------
+Exemplo de cálculo:
+
+Peça com:
+- Ano de fabrico: 1985 → Score 2
+- Nº de sets: 60 → Score 2
+- Nº de lojas: 8 → Score 2
+- Preço médio: 15 USD → Score 2
+- Stock: 30 → Score 1
+
+Rarity Index = (2*0.2) + (2*0.25) + (2*0.2) + (2*0.15) + (1*0.2)
+             = 1.8
+Classificação final: 🟧 Rara
