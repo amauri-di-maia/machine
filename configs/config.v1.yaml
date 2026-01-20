@@ -1,0 +1,35 @@
+version: 1
+
+paths:
+  repo_root: "."
+  sqlite_db: "data base/brickovery.db"
+  lockfile: "data base/locks/brickovery.lock"
+  manifests_dir: "data base/manifests"
+  logs_dir: "data base/logs"
+
+tables:
+  shipping_normal_txt: "data/tables/shipping_normal.txt"
+  shipping_registered_txt: "data/tables/shipping_registered.txt"
+  rarity_rules_txt: "data/tables/rarity_rules.txt"
+
+upstream:
+  repo: "amauri-di-maia/amauri-repo"
+  ref: "f2727fe61be7990d8ef8188325493eec4f1f0ea0"
+  db_relpath: "data base/brickovery.db"
+  checkout_path: "upstream/amauri-repo"
+  token_env: "UPSTREAM_REPO_TOKEN"
+  schema_hint: {}
+
+github_sync:
+  enabled: true
+  pull: true
+  commit: true
+  push: true
+  fail_safe_on_push_conflict: true
+  commit_message_template: "brickovery: {action} (run_id={run_id}, slice_id={slice_id}, upstream_sha={upstream_commit_sha})"
+  git_user_name: "github-actions[bot]"
+  git_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+
+run:
+  seed: 1337
+  timezone: "Europe/Lisbon"
