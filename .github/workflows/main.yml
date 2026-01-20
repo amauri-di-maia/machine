@@ -1,1 +1,0 @@
-python -m brickovery.cli bootstrap --config configs/config.v1.yaml --no-pull --no-commit --no-push
