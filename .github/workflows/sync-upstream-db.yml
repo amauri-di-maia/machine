@@ -17,47 +17,54 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # 1) Checkout do repo Brickovery (onde vamos guardar a cópia da DB)
       - name: Checkout Brickovery
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download upstream DB (GitHub API raw)
-        env:
-          UPSTREAM_REPO_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
-          UPSTREAM_OWNER: amauri-di-maia
-          UPSTREAM_REPO: amauri-repo
-          UPSTREAM_REF: main
-          # upstream path: "data base/brickovery.db" (URL-encoded space)
-          UPSTREAM_PATH: data%20base/brickovery.db
+      # 2) Checkout do repo upstream (amauri-repo) com Git LFS ativado
+      #    e com sparse-checkout apenas do ficheiro necessário.
+      - name: Checkout upstream repo (with LFS)
+        uses: actions/checkout@v4
+        with:
+          repository: amauri-di-maia/amauri-repo
+          token: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+          path: _upstream
+          lfs: true
+          fetch-depth: 1
+          sparse-checkout: |
+            data base/brickovery.db
+          sparse-checkout-cone-mode: false
+
+      # 3) Copiar a DB do upstream para uma pasta "upstream/" no Brickovery
+      - name: Copy upstream DB into this repo
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          cp "_upstream/data base/brickovery.db" "upstream/brickovery.db"
+
+      # 4) Validar que é SQLite e gerar hash SHA256 (para auditoria)
+      - name: Validate SQLite + write SHA256
         run: |
           set -euo pipefail
 
-          mkdir -p upstream
-
-          curl -fL \
-            -H "Authorization: Bearer ${UPSTREAM_REPO_TOKEN}" \
-            -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/contents/${UPSTREAM_PATH}?ref=${UPSTREAM_REF}" \
-            -o upstream/brickovery.db
-
-          # Validar que o download é mesmo SQLite (evita gravar JSON/HTML por engano)
           python - <<'PY'
           import sys
           p = "upstream/brickovery.db"
           with open(p, "rb") as f:
-            sig = f.read(16)
+              sig = f.read(16)
           if not sig.startswith(b"SQLite format 3"):
-            print("ERRO: ficheiro descarregado não parece ser SQLite. Header:", sig)
-            sys.exit(1)
+              print("ERRO: ficheiro não parece ser SQLite. Header:", sig)
+              sys.exit(1)
           print("OK: SQLite header validado.")
           PY
 
           sha256sum upstream/brickovery.db | tee upstream/brickovery.db.sha256
           ls -lh upstream/brickovery.db upstream/brickovery.db.sha256
 
-      # Opcional: só “semeia” a DB de trabalho uma vez, caso ainda não exista.
-      # Se não queres DB de trabalho no repo, remove este step.
+      # 5) Opcional: “seed” da DB de trabalho no root (só se ainda não existir)
+      #    Se NÃO queres ter uma DB de trabalho no root, remove este step.
       - name: Seed working DB (only if missing)
         run: |
           set -euo pipefail
@@ -68,14 +75,15 @@ jobs:
             echo "brickovery.db already exists; not overwriting."
           fi
 
+      # 6) Commit & push apenas se algo mudou
       - name: Commit and push if changed
         run: |
           set -euo pipefail
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add upstream/brickovery.db upstream/brickovery.db.sha256 || true
-          # Se estiveres a usar DB de trabalho no root:
           if [ -f brickovery.db ]; then git add brickovery.db || true; fi
 
           if git diff --cached --quiet; then
@@ -86,6 +94,7 @@ jobs:
           git commit -m "Sync upstream brickovery.db"
           git push
 
+      # 7) Artifact extra (backup fora do git, por run)
       - name: Upload artifact (extra backup)
         uses: actions/upload-artifact@v4
         with:
