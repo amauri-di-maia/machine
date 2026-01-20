@@ -15,21 +15,48 @@ permissions:
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Brickovery repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Clone Brickovery repo manually (avoids checkout post-step)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Checkout upstream repo (read-only)
-        uses: actions/checkout@v4
-        with:
-          repository: amauri-di-maia/amauri-repo
-          ref: f2727fe61be7990d8ef8188325493eec4f1f0ea0
-          path: upstream/amauri-repo
-          token: ${{ secrets.UPSTREAM_REPO_TOKEN }}
-          fetch-depth: 1
+          echo "== Remove accidental gitlinks (mode 160000) under upstream/ =="
+          git ls-files --stage | awk '$1=="160000"{print $4}' | grep -E '^upstream/' || true
+          while read -r mode sha stage path; do
+            if [ "${mode}" = "160000" ] && [[ "${path}" == upstream/* ]]; then
+              echo "Removing gitlink: ${path}"
+              git rm --cached -f "${path}" || true
+            fi
+          done < <(git ls-files --stage)
+
+          echo "== Ensure upstream/ ignored =="
+          grep -qxF "/upstream/" .gitignore 2>/dev/null || echo "/upstream/" >> .gitignore
+          git add .gitignore
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Repair: remove upstream gitlinks and ignore upstream/"
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
+        env:
+          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd repo
+          rm -rf upstream/amauri-repo || true
+          git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
+          cd upstream/amauri-repo
+          git checkout f2727fe61be7990d8ef8188325493eec4f1f0ea0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,9 +65,34 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
+          cd repo
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Preflight - verify required table files exist
+        run: |
+          set -euo pipefail
+          cd repo
+          test -f "data/tables/shipping_normal.txt"
+          test -f "data/tables/shipping_registered.txt"
+          test -f "data/tables/rarity_rules.txt"
+          echo "OK: table files exist"
+          ls -la "data/tables"
+
       - name: Run bootstrap (M0)
         run: |
+          set -euo pipefail
+          cd repo
           python -m brickovery.cli bootstrap --config configs/config.v1.yaml --no-pull
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m0-debug
+          path: |
+            repo/data base/logs
+            repo/data base/manifests
+            repo/data base/brickovery.db
+          if-no-files-found: warn
