@@ -1,4 +1,4 @@
-name: Repair - Remove upstream submodule gitlink
+name: Repair - Remove submodule gitlinks (no checkout)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   repair:
     runs-on: ubuntu-latest
     steps:
-      - name: Repair repo state (manual git clone, no checkout action)
+      - name: Clone repo manually and repair gitlinks
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -25,34 +25,50 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          echo "== Detect gitlink for upstream/amauri-repo (submodule) =="
-          if git ls-files --stage upstream/amauri-repo | grep -q "160000"; then
-            echo "Found gitlink (submodule). Removing from index..."
-            git rm --cached -f upstream/amauri-repo
-          else
-            echo "No gitlink tracked at upstream/amauri-repo"
-          fi
+          echo "== Gitlinks (mode 160000) BEFORE =="
+          git ls-files --stage | awk '$1=="160000"{print}' || true
 
-          echo "== Clean .gitmodules (if any) =="
+          # Remove any gitlink under upstream/ (covers upstream/amauri-repo and any future accidental entries)
+          while read -r mode sha stage path; do
+            if [ "${mode}" = "160000" ] && [[ "${path}" == upstream/* ]]; then
+              echo "Removing gitlink: ${path}"
+              git rm --cached -f "${path}" || true
+            fi
+          done < <(git ls-files --stage)
+
+          echo "== .gitmodules cleanup (only upstream entries) =="
           if [ -f .gitmodules ]; then
-            git config -f .gitmodules --remove-section "submodule.upstream/amauri-repo" || true
+            # remove all sections that point to upstream/*
+            # (safe even if they don't exist)
+            while read -r key; do
+              section="${key#submodule.}"
+              section="${section%.path}"
+              subpath="$(git config -f .gitmodules --get "${key}" || true)"
+              if [[ "${subpath}" == upstream/* ]]; then
+                echo "Removing .gitmodules section: ${section}"
+                git config -f .gitmodules --remove-section "${section}" || true
+              fi
+            done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' || true)
+
             # remove file if empty
-            if [ ! -s .gitmodules ]; then rm -f .gitmodules; fi
+            if ! git config -f .gitmodules --name-only --get-regexp '^submodule\.' >/dev/null 2>&1; then
+              rm -f .gitmodules
+            fi
             git add .gitmodules || true
           fi
 
-          echo "== Remove local submodule metadata (if any) =="
-          rm -rf .git/modules/upstream/amauri-repo || true
-
-          echo "== Ensure upstream folder is ignored =="
+          echo "== Ignore upstream/ folder =="
+          mkdir -p upstream
           grep -qxF "/upstream/" .gitignore 2>/dev/null || echo "/upstream/" >> .gitignore
           git add .gitignore
 
-          echo "== Commit and push if changes exist =="
-          if ! git diff --cached --quiet; then
-            git commit -m "Repair: remove upstream submodule tracking and ignore upstream/"
-            git push origin "HEAD:${BRANCH}"
-            echo "Repair pushed."
-          else
+          echo "== Gitlinks (mode 160000) AFTER =="
+          git ls-files --stage | awk '$1=="160000"{print}' || true
+
+          if git diff --cached --quiet; then
             echo "No changes to commit."
+            exit 0
           fi
+
+          git commit -m "Repair: remove upstream submodule gitlinks and ignore upstream/"
+          git push origin "HEAD:${BRANCH}"
