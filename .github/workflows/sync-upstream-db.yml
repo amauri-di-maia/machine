@@ -1,0 +1,95 @@
+name: Sync upstream brickovery.db
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Diariamente às 03:15 UTC (ajusta se quiseres)
+    - cron: "15 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-db
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Brickovery
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download upstream DB (GitHub API raw)
+        env:
+          UPSTREAM_REPO_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+          UPSTREAM_OWNER: amauri-di-maia
+          UPSTREAM_REPO: amauri-repo
+          UPSTREAM_REF: main
+          # upstream path: "data base/brickovery.db" (URL-encoded space)
+          UPSTREAM_PATH: data%20base/brickovery.db
+        run: |
+          set -euo pipefail
+
+          mkdir -p upstream
+
+          curl -fL \
+            -H "Authorization: Bearer ${UPSTREAM_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/contents/${UPSTREAM_PATH}?ref=${UPSTREAM_REF}" \
+            -o upstream/brickovery.db
+
+          # Validar que o download é mesmo SQLite (evita gravar JSON/HTML por engano)
+          python - <<'PY'
+          import sys
+          p = "upstream/brickovery.db"
+          with open(p, "rb") as f:
+            sig = f.read(16)
+          if not sig.startswith(b"SQLite format 3"):
+            print("ERRO: ficheiro descarregado não parece ser SQLite. Header:", sig)
+            sys.exit(1)
+          print("OK: SQLite header validado.")
+          PY
+
+          sha256sum upstream/brickovery.db | tee upstream/brickovery.db.sha256
+          ls -lh upstream/brickovery.db upstream/brickovery.db.sha256
+
+      # Opcional: só “semeia” a DB de trabalho uma vez, caso ainda não exista.
+      # Se não queres DB de trabalho no repo, remove este step.
+      - name: Seed working DB (only if missing)
+        run: |
+          set -euo pipefail
+          if [ ! -f brickovery.db ]; then
+            cp upstream/brickovery.db brickovery.db
+            echo "Seeded brickovery.db from upstream backup."
+          else
+            echo "brickovery.db already exists; not overwriting."
+          fi
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add upstream/brickovery.db upstream/brickovery.db.sha256 || true
+          # Se estiveres a usar DB de trabalho no root:
+          if [ -f brickovery.db ]; then git add brickovery.db || true; fi
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Sync upstream brickovery.db"
+          git push
+
+      - name: Upload artifact (extra backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-brickovery-db
+          path: |
+            upstream/brickovery.db
+            upstream/brickovery.db.sha256
