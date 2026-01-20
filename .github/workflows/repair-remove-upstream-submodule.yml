@@ -1,0 +1,58 @@
+name: Repair - Remove upstream submodule gitlink
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repair repo state (manual git clone, no checkout action)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "== Detect gitlink for upstream/amauri-repo (submodule) =="
+          if git ls-files --stage upstream/amauri-repo | grep -q "160000"; then
+            echo "Found gitlink (submodule). Removing from index..."
+            git rm --cached -f upstream/amauri-repo
+          else
+            echo "No gitlink tracked at upstream/amauri-repo"
+          fi
+
+          echo "== Clean .gitmodules (if any) =="
+          if [ -f .gitmodules ]; then
+            git config -f .gitmodules --remove-section "submodule.upstream/amauri-repo" || true
+            # remove file if empty
+            if [ ! -s .gitmodules ]; then rm -f .gitmodules; fi
+            git add .gitmodules || true
+          fi
+
+          echo "== Remove local submodule metadata (if any) =="
+          rm -rf .git/modules/upstream/amauri-repo || true
+
+          echo "== Ensure upstream folder is ignored =="
+          grep -qxF "/upstream/" .gitignore 2>/dev/null || echo "/upstream/" >> .gitignore
+          git add .gitignore
+
+          echo "== Commit and push if changes exist =="
+          if ! git diff --cached --quiet; then
+            git commit -m "Repair: remove upstream submodule tracking and ignore upstream/"
+            git push origin "HEAD:${BRANCH}"
+            echo "Repair pushed."
+          else
+            echo "No changes to commit."
+          fi
