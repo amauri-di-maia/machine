@@ -80,6 +80,13 @@ jobs:
           echo "OK: table files exist"
           ls -la "data/tables"
 
+- name: Git diagnostics (must be inside worktree)
+  run: |
+    pwd
+    git rev-parse --is-inside-work-tree
+    git status --porcelain
+    git remote -v
+
       - name: Run bootstrap (M0)
         run: |
           set -euo pipefail
