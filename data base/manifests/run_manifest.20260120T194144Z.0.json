@@ -1,0 +1,13 @@
+{
+  "run_id": "20260120T194144Z",
+  "slice_id": "0",
+  "created_ts": "2026-01-20T19:41:45Z",
+  "config_hash": "bdcb615be20757524f2f5d65e0549f4b2f61d98010c42b993414aead7d509738",
+  "upstream_repo": "amauri-di-maia/amauri-repo",
+  "upstream_ref": "f2727fe61be7990d8ef8188325493eec4f1f0ea0",
+  "upstream_commit_sha": "f2727fe61be7990d8ef8188325493eec4f1f0ea0",
+  "upstream_db_relpath": "data base/brickovery.db",
+  "upstream_db_sha256": "080a2b78991f00867b57ff509f44523a735df6730f359c776d731085276cfcfd",
+  "notes": "M0 bootstrap",
+  "manifest_hash": "0fbdeae4edaf99e613b077f265f998de10985febdbb7a600555adbb451e1157a"
+}
