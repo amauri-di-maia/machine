@@ -21,7 +21,7 @@ upstream:
   schema_hint: {}
 
 github_sync:
-  enabled: true
+  enabled: false
   pull: true
   commit: true
   push: true
