@@ -1,0 +1,146 @@
+name: Brickovery - Inspect Upstream DB Schema
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone Brickovery repo (manual)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+
+      - name: Clone upstream repo (read-only)
+        env:
+          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd repo
+          rm -rf upstream/amauri-repo || true
+          mkdir -p upstream
+          git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
+          cd upstream/amauri-repo
+          git checkout f2727fe61be7990d8ef8188325493eec4f1f0ea0
+
+      - name: Build upstream schema report
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3, re, json, os, textwrap
+          db_path = "repo/upstream/amauri-repo/data base/brickovery.db"
+          con = sqlite3.connect(db_path)
+          con.row_factory = sqlite3.Row
+
+          def tables():
+            return [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")]
+
+          def cols(t):
+            return [r[1] for r in con.execute(f"PRAGMA table_info({t});")]
+
+          def nn_count(t, col, limit=50000):
+            q = f"SELECT SUM(CASE WHEN {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT))!='' THEN 1 ELSE 0 END) AS nn FROM (SELECT {col} FROM {t} LIMIT {limit});"
+            try:
+              return int(con.execute(q).fetchone()["nn"] or 0)
+            except Exception:
+              return 0
+
+          def pick_col(columns, keys):
+            for c in columns:
+              cl = c.lower()
+              if any(k in cl for k in keys):
+                return c
+            return None
+
+          def score_table(t, columns):
+            low = [c.lower() for c in columns]
+            s = 0
+            if any(("boid" in c) or ("brickowl" in c) for c in low): s += 4
+            if any(("weight" in c) or ("gram" in c) or ("mass" in c) for c in low): s += 2
+            if any(("bricklink" in c) or (c.startswith("bl_")) for c in low): s += 2
+            if any(("part" in c) or ("item" in c) or ("no" == c) for c in low): s += 2
+            if any(("color" in c) for c in low): s += 1
+            if any(("itemtype" in c) or (c == "type") for c in low): s += 1
+            return s
+
+          report = []
+          for t in tables():
+            c = cols(t)
+            s = score_table(t, c)
+            if s < 4:
+              continue
+
+            # candidates
+            bl_part = pick_col(c, ["bl_part_id"])
+            bl_color = pick_col(c, ["bl_color_id"])
+            bl_type  = pick_col(c, ["item_type"])
+            bo_boid  = pick_col(c, ["boid"])
+            w_col    = pick_col(c, ["weight"])
+
+            nn_boid = nn_count(t, bo_boid) if bo_boid else 0
+            nn_w    = nn_count(t, w_col) if w_col else 0
+
+            report.append({
+              "table": t,
+              "score": s,
+              "columns": c,
+              "candidate": {
+                "bl_part_col": bl_part,
+                "bl_color_col": bl_color,
+                "bl_itemtype_col": bl_type,
+                "bo_boid_col": bo_boid,
+                "weight_col": w_col,
+              },
+              "sample_non_null": {
+                "boid": nn_boid,
+                "weight": nn_w,
+              }
+            })
+
+          report.sort(key=lambda r: (r["sample_non_null"]["boid"], r["sample_non_null"]["weight"], r["score"]), reverse=True)
+
+          out = ["UPSTREAM DB SCHEMA REPORT", f"db_path={db_path}", ""]
+          out.append("Top mapping candidates (ordered by boid fill then weight fill):")
+          for r in report[:15]:
+            out.append(f"- table={r['table']} score={r['score']} nn_boid(sample)={r['sample_non_null']['boid']} nn_weight(sample)={r['sample_non_null']['weight']}")
+            out.append(f"  candidate={r['candidate']}")
+          out.append("")
+          if report:
+            best = report[0]
+            out.append("Recommended schema_hint to paste into configs/config.v1.yaml:")
+            hint = {
+              "mapping_table": best["table"],
+              "bl_part_col": best["candidate"]["bl_part_col"],
+              "bl_color_col": best["candidate"]["bl_color_col"],
+              "bl_itemtype_col": best["candidate"]["bl_itemtype_col"],
+              "bo_boid_col": best["candidate"]["bo_boid_col"],
+              "weight_col": best["candidate"]["weight_col"],
+            }
+            out.append(textwrap.indent(yaml_like := "\n".join([f"{k}: {v if v is not None else 'null'}" for k,v in hint.items()]), "  "))
+          else:
+            out.append("No good candidates found. We will need manual schema_hint.")
+
+          os.makedirs("repo/data base", exist_ok=True)
+          with open("repo/data base/upstream_schema_report.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+
+          con.close()
+          PY
+
+      - name: Upload schema report
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-schema-report
+          path: repo/data base/upstream_schema_report.txt
+          if-no-files-found: error
