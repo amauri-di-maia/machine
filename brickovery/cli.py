@@ -52,14 +52,35 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         )
         logger.log("upstream.ingested", **up_res)
 
-        sh_hash, sh_n = ingest_shipping_bands(con, cfg.tables.shipping_normal_txt, service_level="NORMAL", dest_country="PT")
-        logger.log("shipping.ingested", service_level="NORMAL", bands=sh_n, source_hash=sh_hash, path=cfg.tables.shipping_normal_txt)
+        sh_hash, sh_n = ingest_shipping_bands(
+            con, cfg.tables.shipping_normal_txt, service_level="NORMAL", dest_country="PT"
+        )
+        logger.log(
+            "shipping.ingested",
+            service_level="NORMAL",
+            bands=sh_n,
+            source_hash=sh_hash,
+            path=cfg.tables.shipping_normal_txt,
+        )
 
-        sh2_hash, sh2_n = ingest_shipping_bands(con, cfg.tables.shipping_registered_txt, service_level="REGISTERED", dest_country="PT")
-        logger.log("shipping.ingested", service_level="REGISTERED", bands=sh2_n, source_hash=sh2_hash, path=cfg.tables.shipping_registered_txt)
+        sh2_hash, sh2_n = ingest_shipping_bands(
+            con, cfg.tables.shipping_registered_txt, service_level="REGISTERED", dest_country="PT"
+        )
+        logger.log(
+            "shipping.ingested",
+            service_level="REGISTERED",
+            bands=sh2_n,
+            source_hash=sh2_hash,
+            path=cfg.tables.shipping_registered_txt,
+        )
 
         rr_hash, rr_rules = ingest_rarity_rules(con, cfg.tables.rarity_rules_txt)
-        logger.log("rarity_rules.ingested", rules_hash=rr_hash, parsed_rules=rr_rules, path=cfg.tables.rarity_rules_txt)
+        logger.log(
+            "rarity_rules.ingested",
+            rules_hash=rr_hash,
+            parsed_rules=rr_rules,
+            path=cfg.tables.rarity_rules_txt,
+        )
 
         cfg_hash = sha256_json(cfg.raw)
         manifest = RunManifest(
@@ -75,6 +96,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             notes="M0 bootstrap",
         )
         manifest_path = write_manifest(manifest, cfg.paths.manifests_dir)
+
         con.execute(
             "INSERT OR REPLACE INTO run_manifest(run_id, slice_id, manifest_json, created_ts) VALUES(?,?,?,?);",
             (run_id, slice_id, Path(manifest_path).read_text(encoding="utf-8"), utc_now_iso()),
@@ -83,32 +105,51 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         con.close()
         logger.log("manifest.written", path=str(manifest_path))
 
+        # -------------------------
+        # Git sync (optional)
+        # -------------------------
         if cfg.github_sync.enabled:
-    do_pull = cfg.github_sync.pull and not args.no_pull
-    do_commit = cfg.github_sync.commit and not args.no_commit
-    do_push = cfg.github_sync.push and not args.no_push
+            do_pull = cfg.github_sync.pull and not args.no_pull
+            do_commit = cfg.github_sync.commit and not args.no_commit
+            do_push = cfg.github_sync.push and not args.no_push
 
-    if not (do_pull or do_commit or do_push):
-        logger.log("git.sync.skipped", reason="all git operations disabled by flags")
-    else:
-        msg = cfg.github_sync.commit_message_template.format(
-            action="bootstrap",
-            run_id=run_id,
-            slice_id=slice_id,
-            upstream_commit_sha=up_res["upstream_commit_sha"],
-        )
-        res = sync_repo(
-            repo_root=repo_root,
-            do_pull=do_pull,
-            do_commit=do_commit,
-            do_push=do_push,
-            commit_message=msg,
-            user_name=cfg.github_sync.git_user_name,
-            user_email=cfg.github_sync.git_user_email,
-            fail_safe_on_push_conflict=cfg.github_sync.fail_safe_on_push_conflict,
-        )
-        logger.log("git.sync", did_commit=res.did_commit, did_push=res.did_push, status=res.status)
+            if not (do_pull or do_commit or do_push):
+                logger.log("git.sync.skipped", reason="all git operations disabled by flags")
+            else:
+                msg = cfg.github_sync.commit_message_template.format(
+                    action="bootstrap",
+                    run_id=run_id,
+                    slice_id=slice_id,
+                    upstream_commit_sha=up_res["upstream_commit_sha"],
+                )
+                res = sync_repo(
+                    repo_root=repo_root,
+                    do_pull=do_pull,
+                    do_commit=do_commit,
+                    do_push=do_push,
+                    commit_message=msg,
+                    user_name=cfg.github_sync.git_user_name,
+                    user_email=cfg.github_sync.git_user_email,
+                    fail_safe_on_push_conflict=cfg.github_sync.fail_safe_on_push_conflict,
+                )
+                logger.log("git.sync", did_commit=res.did_commit, did_push=res.did_push, status=res.status)
 
+        logger.log("bootstrap.done", run_id=run_id, slice_id=slice_id)
+        return 0
+
+    except Exception as e:
+        logger.log("bootstrap.error", exc_type=type(e).__name__, error=str(e))
+        raise
+
+    finally:
+        # Liberta lock sem rebentar caso a implementação não tenha release()
+        rel = getattr(lock, "release", None)
+        if callable(rel):
+            try:
+                rel()
+            except Exception:
+                # Não mascara erros do bootstrap
+                pass
 
 
 def build_parser() -> argparse.ArgumentParser:
