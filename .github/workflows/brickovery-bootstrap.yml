@@ -1,0 +1,46 @@
+name: Brickovery - Bootstrap (M0)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+concurrency:
+  group: brickovery-bootstrap-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Brickovery repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout upstream repo (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: amauri-di-maia/amauri-repo
+          ref: f2727fe61be7990d8ef8188325493eec4f1f0ea0
+          path: upstream/amauri-repo
+          token: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bootstrap (M0)
+        run: |
+          python -m brickovery.cli bootstrap --config configs/config.v1.yaml --no-pull
