@@ -84,28 +84,31 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         logger.log("manifest.written", path=str(manifest_path))
 
         if cfg.github_sync.enabled:
-            msg = cfg.github_sync.commit_message_template.format(
-                action="bootstrap",
-                run_id=run_id,
-                slice_id=slice_id,
-                upstream_commit_sha=up_res["upstream_commit_sha"],
-            )
-            res = sync_repo(
-                repo_root=repo_root,
-                do_pull=cfg.github_sync.pull and not args.no_pull,
-                do_commit=cfg.github_sync.commit and not args.no_commit,
-                do_push=cfg.github_sync.push and not args.no_push,
-                commit_message=msg,
-                user_name=cfg.github_sync.git_user_name,
-                user_email=cfg.github_sync.git_user_email,
-                fail_safe_on_push_conflict=cfg.github_sync.fail_safe_on_push_conflict,
-            )
-            logger.log("git.sync", did_commit=res.did_commit, did_push=res.did_push, status=res.status)
+    do_pull = cfg.github_sync.pull and not args.no_pull
+    do_commit = cfg.github_sync.commit and not args.no_commit
+    do_push = cfg.github_sync.push and not args.no_push
 
-        logger.log("bootstrap.done")
-        return 0
-    finally:
-        lock.release()
+    if not (do_pull or do_commit or do_push):
+        logger.log("git.sync.skipped", reason="all git operations disabled by flags")
+    else:
+        msg = cfg.github_sync.commit_message_template.format(
+            action="bootstrap",
+            run_id=run_id,
+            slice_id=slice_id,
+            upstream_commit_sha=up_res["upstream_commit_sha"],
+        )
+        res = sync_repo(
+            repo_root=repo_root,
+            do_pull=do_pull,
+            do_commit=do_commit,
+            do_push=do_push,
+            commit_message=msg,
+            user_name=cfg.github_sync.git_user_name,
+            user_email=cfg.github_sync.git_user_email,
+            fail_safe_on_push_conflict=cfg.github_sync.fail_safe_on_push_conflict,
+        )
+        logger.log("git.sync", did_commit=res.did_commit, did_push=res.did_push, status=res.status)
+
 
 
 def build_parser() -> argparse.ArgumentParser:
