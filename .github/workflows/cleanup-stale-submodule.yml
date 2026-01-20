@@ -1,0 +1,63 @@
+name: Cleanup stale submodule upstream/amauri-repo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Brickovery
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect and remove stale submodule entry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== Checking index entry for upstream/amauri-repo =="
+          if git ls-files --stage upstream/amauri-repo | grep -q '^160000 '; then
+            echo "Found gitlink (submodule) entry. Removing from index..."
+            git rm -f --cached upstream/amauri-repo
+          else
+            echo "No gitlink entry found in index."
+          fi
+
+          echo "== Removing working tree folder if present =="
+          rm -rf upstream/amauri-repo || true
+
+          echo "== Removing .gitmodules if it contains that path (optional) =="
+          if [ -f .gitmodules ] && grep -q 'upstream/amauri-repo' .gitmodules; then
+            echo "Found reference in .gitmodules. Removing .gitmodules file (or edit if you have other submodules)."
+            # Se NÃO tens outros submodules, podes remover o ficheiro inteiro:
+            git rm -f .gitmodules
+          fi
+
+          echo "== Git status =="
+          git status --porcelain
+
+      - name: Commit and push if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --cached --quiet && [ -z "$(git status --porcelain)" ]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No staged changes after add -A."
+            exit 0
+          fi
+
+          git commit -m "Cleanup stale submodule reference (upstream/amauri-repo)"
+          git push
