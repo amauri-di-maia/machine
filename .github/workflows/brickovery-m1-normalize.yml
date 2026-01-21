@@ -106,14 +106,12 @@ jobs:
 
           # escolher colunas “melhor esforço” para mostrar
           preferred = [
-              "bl_itemtype",
               "item_type",
               "bl_part_id",
-              "part_id",
+              "bo_part_id",
               "bl_color_id",
-              "color_id",
-              "bo_boid",
               "boid",
+              "weight",
               "status",
               "reason",
               "created_ts",
