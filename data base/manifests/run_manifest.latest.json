@@ -1,13 +1,13 @@
 {
-  "run_id": "20260121T005528Z",
+  "run_id": "20260121T013118Z",
   "slice_id": "0",
-  "created_ts": "2026-01-21T00:55:29Z",
-  "config_hash": "585dc9f8bfeb87bd5c8806c2c99a0271541c6948f1961d8f640c34c7d415c8d4",
+  "created_ts": "2026-01-21T01:31:19Z",
+  "config_hash": "a8d4d3385cffb6b664cd09fcacb3c17fbaedf2f172bfa873f20bdc51bda8c263",
   "upstream_repo": "amauri-di-maia/amauri-repo",
-  "upstream_ref": "f2727fe61be7990d8ef8188325493eec4f1f0ea0",
-  "upstream_commit_sha": "f2727fe61be7990d8ef8188325493eec4f1f0ea0",
+  "upstream_ref": "890761b4899290fe4724bda028f235ee34f6c9e5",
+  "upstream_commit_sha": "890761b4899290fe4724bda028f235ee34f6c9e5",
   "upstream_db_relpath": "data base/brickovery.db",
-  "upstream_db_sha256": "080a2b78991f00867b57ff509f44523a735df6730f359c776d731085276cfcfd",
+  "upstream_db_sha256": "bddb967743a1b3a92419b28e4fd9c470d516c645a0fb5230d94f50e4015110e5",
   "notes": "M0 bootstrap",
-  "manifest_hash": "3992bb9eea10b4e511bea324b9ea47199601bf21b52c034d2d1c30fe152a4919"
+  "manifest_hash": "3f561beaa9fae36424ece674ba8a05c76efb0853da1e84a79a4bacba890e9b4d"
 }
