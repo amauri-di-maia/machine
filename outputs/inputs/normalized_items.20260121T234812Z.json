@@ -1,0 +1,14 @@
+[
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "3005",
+    "bl_color_id": 80,
+    "condition": "U",
+    "qty": 1,
+    "bo_boid": null,
+    "weight_mg": 440,
+    "mapping_source": "none",
+    "mapping_status": "MISSING_BOID",
+    "weight_status": "OK"
+  }
+]
