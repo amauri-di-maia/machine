@@ -276,6 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--lock-ttl-seconds", type=int, default=3600)
     b.add_argument("--lock-wait-seconds", type=int, default=0)
     b.set_defaults(func=cmd_bootstrap)
+    n = sub.add_parser("normalize-input", help="M1 parse + normalize search.xml")
+    n.add_argument("--config", required=True)
+    n.add_argument("--input", default="inputs/search.xml")
+    n.add_argument("--output-dir", default="outputs/inputs")
+    n.add_argument("--run-id", default=None)
+    n.add_argument("--slice-id", default="0")
+    n.add_argument("--lock-ttl-seconds", type=int, default=3600)
+    n.add_argument("--lock-wait-seconds", type=int, default=0)
+    n.set_defaults(func=cmd_normalize_input)
 
     return p
 
