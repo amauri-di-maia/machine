@@ -1,4 +1,4 @@
-name: Brickovery - Inspect Upstream DB Schema
+name: Brickovery - Inspect Upstream DB (schema + fill rates)
 
 on:
   workflow_dispatch:
@@ -34,102 +34,85 @@ jobs:
           cd upstream/amauri-repo
           git checkout f2727fe61be7990d8ef8188325493eec4f1f0ea0
 
-      - name: Build upstream schema report
+      - name: Build schema report (tables + candidate columns + non-null counts)
         run: |
           set -euo pipefail
           python - <<'PY'
-          import sqlite3, re, json, os, textwrap
+          import sqlite3, os, re, textwrap
+
           db_path = "repo/upstream/amauri-repo/data base/brickovery.db"
           con = sqlite3.connect(db_path)
           con.row_factory = sqlite3.Row
 
           def tables():
-            return [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")]
+            return [r["name"] for r in con.execute(
+              "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+            )]
 
           def cols(t):
-            return [r[1] for r in con.execute(f"PRAGMA table_info({t});")]
+            return [r["name"] for r in con.execute(f"PRAGMA table_info('{t}');")]
 
-          def nn_count(t, col, limit=50000):
-            q = f"SELECT SUM(CASE WHEN {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT))!='' THEN 1 ELSE 0 END) AS nn FROM (SELECT {col} FROM {t} LIMIT {limit});"
+          def nn_count(t, col, limit=80000):
+            if not col: return 0
+            q = f"""
+              SELECT SUM(CASE WHEN {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT))!='' THEN 1 ELSE 0 END) AS nn
+              FROM (SELECT {col} FROM '{t}' LIMIT {limit});
+            """
             try:
               return int(con.execute(q).fetchone()["nn"] or 0)
             except Exception:
               return 0
 
-          def pick_col(columns, keys):
+          def pick(columns, keys):
             for c in columns:
               cl = c.lower()
               if any(k in cl for k in keys):
                 return c
             return None
 
-          def score_table(t, columns):
-            low = [c.lower() for c in columns]
-            s = 0
-            if any(("boid" in c) or ("brickowl" in c) for c in low): s += 4
-            if any(("weight" in c) or ("gram" in c) or ("mass" in c) for c in low): s += 2
-            if any(("bricklink" in c) or (c.startswith("bl_")) for c in low): s += 2
-            if any(("part" in c) or ("item" in c) or ("no" == c) for c in low): s += 2
-            if any(("color" in c) for c in low): s += 1
-            if any(("itemtype" in c) or (c == "type") for c in low): s += 1
-            return s
-
-          report = []
+          candidates = []
           for t in tables():
             c = cols(t)
-            s = score_table(t, c)
-            if s < 4:
+            low = [x.lower() for x in c]
+
+            # Só considerar tabelas que tenham “sinais” fortes
+            if not any("boid" in x or "brickowl" in x for x in low) and not any("weight" in x or "gram" in x or "mass" in x for x in low):
               continue
 
-            # candidates
-            bl_part = pick_col(c, ["bl_part_id"])
-            bl_color = pick_col(c, ["bl_color_id"])
-            bl_type  = pick_col(c, ["item_type"])
-            bo_boid  = pick_col(c, ["boid"])
-            w_col    = pick_col(c, ["weight"])
+            boid_col = pick(c, ["boid"])
+            w_col    = pick(c, ["weight"])
+            bl_part  = pick(c, ["bl_part_id"])
+            bl_color = pick(c, ["bl_color_id"])
+            it_type  = pick(c, ["item_type"])
 
-            nn_boid = nn_count(t, bo_boid) if bo_boid else 0
-            nn_w    = nn_count(t, w_col) if w_col else 0
+            nn_boid = nn_count(t, boid_col)
+            nn_w    = nn_count(t, w_col)
 
-            report.append({
-              "table": t,
-              "score": s,
-              "columns": c,
-              "candidate": {
-                "bl_part_col": bl_part,
-                "bl_color_col": bl_color,
-                "bl_itemtype_col": bl_type,
-                "bo_boid_col": bo_boid,
-                "weight_col": w_col,
-              },
-              "sample_non_null": {
-                "boid": nn_boid,
-                "weight": nn_w,
-              }
-            })
+            score = 0
+            score += 10 if nn_boid > 0 else 0
+            score += 5  if nn_w > 0 else 0
+            score += 2  if bl_part else 0
+            score += 1  if bl_color else 0
+            score += 1  if it_type else 0
 
-          report.sort(key=lambda r: (r["sample_non_null"]["boid"], r["sample_non_null"]["weight"], r["score"]), reverse=True)
+            candidates.append((score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type, c))
 
-          out = ["UPSTREAM DB SCHEMA REPORT", f"db_path={db_path}", ""]
-          out.append("Top mapping candidates (ordered by boid fill then weight fill):")
-          for r in report[:15]:
-            out.append(f"- table={r['table']} score={r['score']} nn_boid(sample)={r['sample_non_null']['boid']} nn_weight(sample)={r['sample_non_null']['weight']}")
-            out.append(f"  candidate={r['candidate']}")
+          candidates.sort(reverse=True)
+
+          out = []
+          out.append("UPSTREAM SCHEMA REPORT")
+          out.append(f"db_path: {db_path}")
           out.append("")
-          if report:
-            best = report[0]
-            out.append("Recommended schema_hint to paste into configs/config.v1.yaml:")
-            hint = {
-              "mapping_table": best["table"],
-              "bl_part_col": best["candidate"]["bl_part_col"],
-              "bl_color_col": best["candidate"]["bl_color_col"],
-              "bl_itemtype_col": best["candidate"]["bl_itemtype_col"],
-              "bo_boid_col": best["candidate"]["bo_boid_col"],
-              "weight_col": best["candidate"]["weight_col"],
-            }
-            out.append(textwrap.indent(yaml_like := "\n".join([f"{k}: {v if v is not None else 'null'}" for k,v in hint.items()]), "  "))
-          else:
-            out.append("No good candidates found. We will need manual schema_hint.")
+          out.append("TOP CANDIDATES (ordered by score, then nn_boid, then nn_weight):")
+          out.append("format: score | nn_boid(sample) | nn_weight(sample) | table | boid_col | weight_col | bl_part_col | bl_color_col | bl_itemtype_col")
+          out.append("-"*120)
+
+          for score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type, c in candidates[:25]:
+            out.append(f"{score:>5} | {nn_boid:>14} | {nn_w:>16} | {t} | {boid_col} | {w_col} | {bl_part} | {bl_color} | {it_type}")
+
+          out.append("")
+          out.append("NOTE: 'sample' counts are on the first 80k rows (enough to detect real fill).")
+          out.append("")
 
           os.makedirs("repo/data base", exist_ok=True)
           with open("repo/data base/upstream_schema_report.txt", "w", encoding="utf-8") as f:
