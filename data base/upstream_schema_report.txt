@@ -1,0 +1,7 @@
+UPSTREAM SCHEMA REPORT
+db_path: upstream/amauri-repo/data base/brickovery.db
+
+TOP CANDIDATES (ordered by score, nn_boid(sample), nn_weight(sample))
+score | nn_boid | nn_weight | table | boid_col | weight_col | bl_part_col | bl_color_col | bl_itemtype_col
+------------------------------------------------------------------------------------------------------------------------
+   13 |   77422 |         0 | part_color_map | boid | None | bl_part_id | bl_color_id | None
