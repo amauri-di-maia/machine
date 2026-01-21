@@ -51,7 +51,10 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+          python -m brickovery.cli normalize-input \
+            --config configs/config.v1.yaml \
+            --input inputs/search.xml \
+            --output-dir outputs/inputs
 
       - name: Post-M1 sanity (schema + fill_later sample, no assumptions)
         working-directory: repo
@@ -76,38 +79,65 @@ jobs:
           import sqlite3
 
           db = "data base/brickovery.db"
-    con = sqlite3.connect(db)
-    con.row_factory = sqlite3.Row
+          con = sqlite3.connect(db)
+          con.row_factory = sqlite3.Row
 
-    def cols(table):
-      return [r["name"] for r in con.execute(f"PRAGMA table_info('{table}')")]
+          def cols(table):
+              return [r["name"] for r in con.execute(f"PRAGMA table_info('{table}')")]
 
-    if "mapping_overrides" not in [r["name"] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]:
-      print("mapping_overrides table does not exist.")
-      raise SystemExit(0)
+          tables = [
+              r["name"]
+              for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+          ]
 
-    c = cols("mapping_overrides")
-    if "status" not in c:
-      print("mapping_overrides has no 'status' column. Columns:", c)
-      raise SystemExit(0)
+          if "mapping_overrides" not in tables:
+              print("mapping_overrides table does not exist.")
+              raise SystemExit(0)
 
-    n = con.execute("SELECT COUNT(*) AS n FROM mapping_overrides WHERE status='fill_later'").fetchone()["n"]
-    print("fill_later rows:", n)
+          c = cols("mapping_overrides")
+          if "status" not in c:
+              print("mapping_overrides has no 'status' column. Columns:", c)
+              raise SystemExit(0)
 
-    # escolher colunas “melhor esforço” para mostrar
-    preferred = ["bl_itemtype","item_type","bl_part_id","part_id","bl_color_id","color_id","bo_boid","boid","status","reason","created_ts","updated_ts"]
-    show = [x for x in preferred if x in c]
-    if not show:
-      show = c[:8]  # fallback
-    sql = "SELECT " + ", ".join(show) + " FROM mapping_overrides WHERE status='fill_later' ORDER BY created_ts DESC LIMIT 10"
-    rows = con.execute(sql).fetchall()
-    print("== sample fill_later rows ==")
-    print("columns:", show)
-    for r in rows:
-      print({k: r[k] for k in show})
-    con.close()
-    PY
+          n = con.execute(
+              "SELECT COUNT(*) AS n FROM mapping_overrides WHERE status='fill_later'"
+          ).fetchone()["n"]
+          print("fill_later rows:", n)
 
+          # escolher colunas “melhor esforço” para mostrar
+          preferred = [
+              "bl_itemtype",
+              "item_type",
+              "bl_part_id",
+              "part_id",
+              "bl_color_id",
+              "color_id",
+              "bo_boid",
+              "boid",
+              "status",
+              "reason",
+              "created_ts",
+              "updated_ts",
+          ]
+          show = [x for x in preferred if x in c]
+          if not show:
+              show = c[:8]  # fallback
+
+          sql = (
+              "SELECT "
+              + ", ".join(show)
+              + " FROM mapping_overrides WHERE status='fill_later' "
+              + " ORDER BY created_ts DESC LIMIT 10"
+          )
+          rows = con.execute(sql).fetchall()
+
+          print("== sample fill_later rows ==")
+          print("columns:", show)
+          for r in rows:
+              print({k: r[k] for k in show})
+
+          con.close()
+          PY
 
       - name: Commit and push outputs (controlled)
         working-directory: repo
