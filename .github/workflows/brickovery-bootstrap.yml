@@ -51,6 +51,14 @@ jobs:
           cd upstream/amauri-repo
           git checkout f2727fe61be7990d8ef8188325493eec4f1f0ea0
 
+      - name: Verify upstream schema (brickovery_db)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          sqlite3 "repo/upstream/amauri-repo/data base/brickovery.db" ".tables"
+          sqlite3 "repo/upstream/amauri-repo/data base/brickovery.db" "PRAGMA table_info('brickovery_db');"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
