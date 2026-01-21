@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass, fields, MISSING
+from dataclasses import dataclass, fields, MISSING
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,8 +63,22 @@ def _build_dataclass_instance(cls: Any, data: Dict[str, Any]) -> Any:
     return cls(**kwargs)
 
 
-def _ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+def _schema_hint_to_dict(hint_obj: Any) -> Dict[str, Any]:
+    """Converte schema_hint (dict ou Pydantic) para dict puro."""
+    if not hint_obj:
+        return {}
+    if isinstance(hint_obj, dict):
+        return hint_obj
+    if hasattr(hint_obj, "model_dump"):
+        # Pydantic v2
+        return hint_obj.model_dump()
+    if hasattr(hint_obj, "dict"):
+        # Pydantic v1
+        return hint_obj.dict()
+    try:
+        return dict(hint_obj)
+    except Exception:
+        return {}
 
 
 # =========================
@@ -182,16 +196,17 @@ def _lookup_upstream(con, it: _RawItem) -> Tuple[Optional[int], Optional[int]]:
     row = con.execute(q, (it.bl_itemtype, it.bl_part_id, it.bl_color_id, it.bl_color_id)).fetchone()
     if row is None:
         return None, None
-    boid = row[0]
-    wmg = row[1]
+
     try:
-        boid_i = int(boid) if boid is not None else None
+        boid_i = int(row[0]) if row[0] is not None else None
     except Exception:
         boid_i = None
+
     try:
-        wmg_i = int(wmg) if wmg is not None else None
+        wmg_i = int(row[1]) if row[1] is not None else None
     except Exception:
         wmg_i = None
+
     return boid_i, wmg_i
 
 
@@ -243,10 +258,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     try:
         logger.log("bootstrap.start", config=args.config)
 
-        # Optional: pull (apenas se não desativado)
+        # Optional: pull
         if getattr(cfg.github_sync, "enabled", False) and getattr(cfg.github_sync, "pull", False) and not args.no_pull:
             logger.log("git.pull.start")
-            # sync_repo exige commit_message; passamos dummy e do_commit/do_push False
             sync_repo(
                 repo_root=cfg.paths.repo_root,
                 do_pull=True,
@@ -263,23 +277,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         migrate(con)
         logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
 
-        schema_hint: Dict[str, Any] = {}
-hint_obj = getattr(cfg.upstream, "schema_hint", None)
-
-if hint_obj:
-    if isinstance(hint_obj, dict):
-        schema_hint = hint_obj
-    elif hasattr(hint_obj, "model_dump"):
-        # Pydantic v2
-        schema_hint = hint_obj.model_dump()
-    elif hasattr(hint_obj, "dict"):
-        # Pydantic v1 (fallback)
-        schema_hint = hint_obj.dict()
-    else:
-        # último fallback
-        schema_hint = dict(hint_obj)
-
-
+        schema_hint = _schema_hint_to_dict(getattr(cfg.upstream, "schema_hint", None))
         upstream_checkout_path = getattr(cfg.upstream, "checkout_path", None) or args.upstream_checkout_path
 
         up_res = ingest_upstream_mapping(
@@ -292,18 +290,15 @@ if hint_obj:
         )
         logger.log("upstream.ingested", **up_res)
 
-        # Shipping
         sn_hash, sn_n = ingest_shipping_bands(con, cfg.tables.shipping_normal_txt, service_level="normal", dest_country="PT")
         logger.log("shipping.ingested", service_level="normal", bands=sn_n, source_hash=sn_hash)
 
         sr_hash, sr_n = ingest_shipping_bands(con, cfg.tables.shipping_registered_txt, service_level="registered", dest_country="PT")
         logger.log("shipping.ingested", service_level="registered", bands=sr_n, source_hash=sr_hash)
 
-        # Rarity rules
         rr_hash, rr_n = ingest_rarity_rules(con, cfg.tables.rarity_rules_txt)
         logger.log("rarity.ingested", rules=rr_n, source_hash=rr_hash)
 
-        # Manifest (compatível com diferentes versões do dataclass)
         cfg_hash = sha256_json(_cfg_to_dict(cfg))
         manifest_data = {
             "run_id": run_id,
@@ -329,9 +324,13 @@ if hint_obj:
 
         logger.log("bootstrap.done", run_id=run_id, slice_id=slice_id, manifest_path=str(manifest_path))
 
-        # Optional: commit/push (apenas se não desativado)
+        # Optional: commit/push
         if getattr(cfg.github_sync, "enabled", False) and not args.no_commit:
-            msg_tmpl = getattr(cfg.github_sync, "commit_message_template", "brickovery: {action} (run_id={run_id}, slice_id={slice_id})")
+            msg_tmpl = getattr(
+                cfg.github_sync,
+                "commit_message_template",
+                "brickovery: {action} (run_id={run_id}, slice_id={slice_id})",
+            )
             msg = msg_tmpl.format(
                 action="bootstrap",
                 run_id=run_id,
@@ -433,7 +432,6 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
 
         con.commit()
 
-        # outputs
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -461,7 +459,6 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         input_manifest_path = out_dir / f"input_manifest.{run_id}.json"
         input_manifest_path.write_text(json.dumps(input_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-        # Run manifest (compatível)
         cfg_hash = sha256_json(_cfg_to_dict(cfg))
         manifest_data = {
             "run_id": run_id,
@@ -493,7 +490,13 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         con.commit()
         con.close()
 
-        logger.log("normalize.done", **stats, total_weight_mg=total_weight_mg, normalized_path=str(normalized_path), input_manifest_path=str(input_manifest_path))
+        logger.log(
+            "normalize.done",
+            **stats,
+            total_weight_mg=total_weight_mg,
+            normalized_path=str(normalized_path),
+            input_manifest_path=str(input_manifest_path),
+        )
         return 0
 
     finally:
@@ -508,7 +511,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="brickovery")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # M0
     b = sub.add_parser("bootstrap", help="M0: ingest upstream mapping + shipping bands + rarity rules")
     b.add_argument("--config", required=True)
     b.add_argument("--run-id", default=None)
@@ -521,7 +523,6 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--lock-wait-seconds", type=int, default=0)
     b.set_defaults(func=cmd_bootstrap)
 
-    # M1
     n = sub.add_parser("normalize-input", help="M1: parse + normalize search.xml (creates overrides if missing BOID)")
     n.add_argument("--config", required=True)
     n.add_argument("--input", default="inputs/search.xml")
