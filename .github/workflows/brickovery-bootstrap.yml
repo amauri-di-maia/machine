@@ -91,6 +91,20 @@ jobs:
             --no-commit \
             --no-push
 
+      - name: Sanity check - fill rates in working DB
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          sqlite3 "data base/brickovery.db" "
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN bo_boid IS NOT NULL AND TRIM(CAST(bo_boid AS TEXT))!='' THEN 1 ELSE 0 END) AS nn_boid,
+              SUM(CASE WHEN weight_mg IS NOT NULL AND weight_mg>0 THEN 1 ELSE 0 END) AS nn_weight_mg
+            FROM up_mapping_mirror;
+          "
+          
       - name: Build upstream schema report (creates upstream_schema_report.txt)
         working-directory: repo
         run: |
