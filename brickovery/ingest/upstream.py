@@ -36,9 +36,9 @@ def _score_mapping_table(cols: List[str]) -> int:
         score += 2
     if any(("boid" in c) or ("brickowl" in c) for c in low):
         score += 3
-    if any(("itemtype" in c) or (c == "type") for c in low):
+    if any(("itemtype" in c) or (c == "type") or ("item_type" in c) for c in low):
         score += 1
-    if any(("weight" in c) or ("grams" in c) for c in low):
+    if any(("weight" in c) or ("grams" in c) or ("mass" in c) for c in low):
         score += 1
     return score
 
@@ -52,7 +52,10 @@ def _choose_best_table(con: sqlite3.Connection) -> Tuple[str, Dict[str, str]]:
         if s >= 6:
             candidates.append((s, t, cols))
     if not candidates:
-        raise RuntimeError("Could not auto-detect mapping table in upstream DB. Provide schema_hint.mapping_table and column names in config.")
+        raise RuntimeError(
+            "Could not auto-detect mapping table in upstream DB. "
+            "Provide schema_hint.mapping_table and column names in config."
+        )
     candidates.sort(reverse=True, key=lambda x: (x[0], x[1]))
     top_score = candidates[0][0]
     best = [c for c in candidates if c[0] == top_score]
@@ -73,9 +76,9 @@ def _choose_best_table(con: sqlite3.Connection) -> Tuple[str, Dict[str, str]]:
 
     mapping = {
         "mapping_table": table,
-        "bl_part_col": pick(["bl_part", "bricklink", "part_id", "bl_id", "item_id", "partno"]),
-        "bl_color_col": pick(["bl_color", "bricklink_color", "color"]),
-        "bl_itemtype_col": pick(["itemtype", "type"]),
+        "bl_part_col": pick(["bl_part", "bricklink", "part_id", "bl_id", "item_id", "partno", "bl_part_id"]),
+        "bl_color_col": pick(["bl_color", "bricklink_color", "color", "bl_color_id"]),
+        "bl_itemtype_col": pick(["itemtype", "item_type", "type"]),
         "bo_boid_col": pick(["boid", "brickowl", "bo_boid"]),
         "weight_g_col": pick(["weight", "grams", "mass"]),
     }
@@ -90,6 +93,17 @@ def _row_hash(*vals: Any) -> str:
         h.update(str(v).encode("utf-8"))
         h.update(b"|")
     return h.hexdigest()
+
+
+def _normalize_boid(v: Any) -> Optional[str]:
+    """
+    BOID no upstream pode ser TEXT (ex.: '656416-20').
+    Nunca converter para int: preservar string canónica.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
 
 
 def ingest_upstream_mapping(
@@ -156,18 +170,19 @@ def ingest_upstream_mapping(
     null_boid = 0
 
     for r in rows:
-        itemtype = str(r["bl_itemtype"]) if r["bl_itemtype"] is not None else "P"
-        part_id = str(r["bl_part_id"])
+        itemtype = str(r["bl_itemtype"]).strip() if r["bl_itemtype"] is not None else "P"
+        part_id = str(r["bl_part_id"]).strip()
+
         color_id = r["bl_color_id"]
         try:
             color_id_int = int(color_id) if color_id is not None else None
         except Exception:
             color_id_int = None
-        boid = r["bo_boid"]
-        try:
-            boid_int = int(boid) if boid is not None else None
-        except Exception:
-            boid_int = None
+
+        # BOID: preservar string (pode conter '-')
+        boid_txt = _normalize_boid(r["bo_boid"])
+
+        # Peso: assumir que upstream está em gramas (float/int) e converter para mg
         weight_mg = None
         if r["weight_g"] is not None:
             try:
@@ -177,25 +192,29 @@ def ingest_upstream_mapping(
 
         if color_id_int is None:
             null_color += 1
-        if boid_int is None:
+        if boid_txt is None:
             null_boid += 1
         if weight_mg is None:
             null_weight += 1
 
-        rh = _row_hash(itemtype, part_id, color_id_int, boid_int, weight_mg)
+        rh = _row_hash(itemtype, part_id, color_id_int, boid_txt, weight_mg)
+
         con_work.execute(
-            "INSERT OR REPLACE INTO up_mapping_mirror(bl_itemtype, bl_part_id, bl_color_id, bo_boid, weight_mg, source, row_hash, ingested_ts) VALUES(?,?,?,?,?,?,?,?);",
-            (itemtype, part_id, color_id_int, boid_int, weight_mg, "upstream", rh, ts),
+            "INSERT OR REPLACE INTO up_mapping_mirror("
+            "bl_itemtype, bl_part_id, bl_color_id, bo_boid, weight_mg, source, row_hash, ingested_ts"
+            ") VALUES(?,?,?,?,?,?,?,?);",
+            (itemtype, part_id, color_id_int, boid_txt, weight_mg, "upstream", rh, ts),
         )
         inserted += 1
 
     con_work.execute("DELETE FROM upstream_state WHERE id=1;")
     con_work.execute(
-        "INSERT INTO upstream_state(id, upstream_repo, upstream_ref, upstream_commit_sha, upstream_db_relpath, upstream_db_sha256, ingested_ts) VALUES(1,?,?,?,?,?,?);",
+        "INSERT INTO upstream_state("
+        "id, upstream_repo, upstream_ref, upstream_commit_sha, upstream_db_relpath, upstream_db_sha256, ingested_ts"
+        ") VALUES(1,?,?,?,?,?,?);",
         (upstream_repo, upstream_ref, upstream_commit_sha, upstream_db_relpath, upstream_db_sha256, ts),
     )
     con_work.commit()
-
     con_up.close()
 
     return {
