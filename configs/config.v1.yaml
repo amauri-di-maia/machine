@@ -14,7 +14,7 @@ tables:
 
 upstream:
   repo: "amauri-di-maia/amauri-repo"
-  ref: "f2727fe61be7990d8ef8188325493eec4f1f0ea0"
+  ref: "890761b4899290fe4724bda028f235ee34f6c9e5"
   db_relpath: "data base/brickovery.db"
   schema_hint:
     mapping_table: "brickovery_db"
