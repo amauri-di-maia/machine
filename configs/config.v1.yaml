@@ -13,8 +13,9 @@ tables:
   rarity_rules_txt: "data/tables/rarity_rules.txt"
 
 upstream:
-  db_relpath: "data base/brickovery.db"
+  repo: "amauri-di-maia/amauri-repo"
   ref: "f2727fe61be7990d8ef8188325493eec4f1f0ea0"
+  db_relpath: "data base/brickovery.db"
   schema_hint:
     mapping_table: "brickovery_db"
     bl_part_col: "bl_part_id"
