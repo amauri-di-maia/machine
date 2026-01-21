@@ -263,9 +263,22 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         migrate(con)
         logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
 
-        schema_hint = {}
-        if hasattr(cfg.upstream, "schema_hint") and cfg.upstream.schema_hint:
-            schema_hint = cfg.upstream.schema_hint
+        schema_hint: Dict[str, Any] = {}
+hint_obj = getattr(cfg.upstream, "schema_hint", None)
+
+if hint_obj:
+    if isinstance(hint_obj, dict):
+        schema_hint = hint_obj
+    elif hasattr(hint_obj, "model_dump"):
+        # Pydantic v2
+        schema_hint = hint_obj.model_dump()
+    elif hasattr(hint_obj, "dict"):
+        # Pydantic v1 (fallback)
+        schema_hint = hint_obj.dict()
+    else:
+        # último fallback
+        schema_hint = dict(hint_obj)
+
 
         upstream_checkout_path = getattr(cfg.upstream, "checkout_path", None) or args.upstream_checkout_path
 
