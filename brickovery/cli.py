@@ -16,6 +16,13 @@ from .ingest.upstream import ingest_upstream_mapping
 from .ingest.shipping import ingest_shipping_bands
 from .ingest.rarity_rules import ingest_rarity_rules
 
+from pathlib import Path
+import json
+
+from .io.hashing import sha256_file
+from .io.search_xml import parse_search_xml
+from .normalize.normalize_input import aggregate_requested, normalize_items, normalized_items_hash
+
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
