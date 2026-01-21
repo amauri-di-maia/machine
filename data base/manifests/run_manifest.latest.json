@@ -1,7 +1,7 @@
 {
-  "run_id": "20260121T022823Z",
+  "run_id": "20260121T023122Z",
   "slice_id": "0",
-  "created_ts": "2026-01-21T02:28:24Z",
+  "created_ts": "2026-01-21T02:31:23Z",
   "config_hash": "a8d4d3385cffb6b664cd09fcacb3c17fbaedf2f172bfa873f20bdc51bda8c263",
   "upstream_repo": "amauri-di-maia/amauri-repo",
   "upstream_ref": "890761b4899290fe4724bda028f235ee34f6c9e5",
@@ -9,5 +9,12 @@
   "upstream_db_relpath": "data base/brickovery.db",
   "upstream_db_sha256": "bddb967743a1b3a92419b28e4fd9c470d516c645a0fb5230d94f50e4015110e5",
   "notes": "M0 bootstrap",
-  "manifest_hash": "c8bbd190878e04eccc1b6bd6e2609574f5907ac4fa461837a595b2b1bc04af11"
+  "input_path": null,
+  "input_sha256": null,
+  "input_items_hash": null,
+  "normalized_items_path": null,
+  "normalized_items_sha256": null,
+  "missing_mapping_count": null,
+  "total_weight_mg": null,
+  "manifest_hash": "0875a3d4b33e0300a5c45f7123b1cf3494e95c1ac8a96da47925926631c1539d"
 }
