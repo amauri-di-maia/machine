@@ -53,6 +53,27 @@ jobs:
           set -euo pipefail
           python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
 
+      - name: Post-M1 sanity (DB + overrides)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          echo "== overrides fill_later =="
+          sqlite3 "data base/brickovery.db" "
+            SELECT COUNT(*) AS n_fill_later
+            FROM mapping_overrides
+            WHERE status='fill_later';
+          "
+          echo "== sample fill_later rows =="
+          sqlite3 "data base/brickovery.db" "
+            SELECT bl_itemtype, bl_part_id, bl_color_id, bo_boid, status, reason, created_ts
+            FROM mapping_overrides
+            WHERE status='fill_later'
+            ORDER BY created_ts DESC
+            LIMIT 10;
+          "
+
       - name: Commit and push outputs (controlled)
         working-directory: repo
         run: |
