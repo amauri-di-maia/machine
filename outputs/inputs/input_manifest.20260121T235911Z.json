@@ -1,0 +1,22 @@
+{
+  "run_id": "20260121T235911Z",
+  "slice_id": "0",
+  "created_ts": "2026-01-21T23:59:11Z",
+  "input_path": "inputs/search.xml",
+  "input_sha256": "9150f3001efbf7d3051b09fd798cfa2ac7be4810d1ead597be560ffbf5c3ee84",
+  "normalized_items_path": "outputs/inputs/normalized_items.20260121T235911Z.json",
+  "normalized_items_sha256": "5cf6007f9d4546492d2e2ae7447812171b18901600838baaceac21ddd11589df",
+  "normalized_items_hash": "99fbcf59b0e65425c5c12715e5fbaac4230138e61f36330df8a139b7ce4aae62",
+  "stats": {
+    "raw_items": 1,
+    "requested_items": 1,
+    "mapped_ok": 1,
+    "missing_boid": 0,
+    "weight_ok": 1,
+    "missing_weight": 0,
+    "overrides_created": 0,
+    "overrides_promoted": 1
+  },
+  "total_weight_mg": 440,
+  "manifest_hash": "ef5945a38f2daa2548e53379aa4da3b77d54e88e84eb86e92819b4476c92b643"
+}
