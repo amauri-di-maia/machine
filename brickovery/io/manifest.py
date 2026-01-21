@@ -10,16 +10,30 @@ from .hashing import sha256_json
 
 @dataclass
 class RunManifest:
+    # core
     run_id: str
     slice_id: str
     created_ts: str
     config_hash: str
+
+    # upstream audit
     upstream_repo: str
     upstream_ref: str
     upstream_commit_sha: str
     upstream_db_relpath: str
     upstream_db_sha256: str
-    notes: Optional[str] = None
+
+    # human note
+    notes: str
+
+    # optional (M1+)
+    input_path: Optional[str] = None
+    input_sha256: Optional[str] = None
+    input_items_hash: Optional[str] = None
+    normalized_items_path: Optional[str] = None
+    normalized_items_sha256: Optional[str] = None
+    missing_mapping_count: Optional[int] = None
+    total_weight_mg: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
