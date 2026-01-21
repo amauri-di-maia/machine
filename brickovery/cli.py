@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, fields, MISSING
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config.loader import load_config
 from .repositories.db import connect, migrate
-from .github_sync.lock import RepoLock, RepoLockError
+from .github_sync.lock import RepoLock
 from .github_sync.sync import sync_repo
 from .logging.logger import JsonlLogger
-from .io.hashing import sha256_json
+from .io.hashing import sha256_json, sha256_file
 from .io.timeutil import make_run_id, utc_now_iso
 from .io.manifest import RunManifest, write_manifest
 
@@ -16,42 +20,258 @@ from .ingest.upstream import ingest_upstream_mapping
 from .ingest.shipping import ingest_shipping_bands
 from .ingest.rarity_rules import ingest_rarity_rules
 
-from pathlib import Path
-import json
 
-from .io.hashing import sha256_file
-from .io.search_xml import parse_search_xml
-from .normalize.normalize_input import aggregate_requested, normalize_items, normalized_items_hash
+# =========================
+# Helpers (robustos)
+# =========================
 
+def _cfg_to_dict(cfg: Any) -> Dict[str, Any]:
+    """Extrai um dict estável do cfg para hashing/auditoria, sem depender do formato interno."""
+    if hasattr(cfg, "raw") and isinstance(getattr(cfg, "raw"), dict) and cfg.raw:
+        return dict(cfg.raw)
+    if hasattr(cfg, "model_dump"):
+        return cfg.model_dump()
+    # fallback extremo
+    return json.loads(json.dumps(cfg, default=str))
+
+
+def _build_dataclass_instance(cls: Any, data: Dict[str, Any]) -> Any:
+    """
+    Constrói um dataclass (RunManifest) de forma compatível mesmo se o schema do dataclass variar.
+    Só passa campos existentes; falha com mensagem clara se faltar algum campo obrigatório.
+    """
+    kwargs: Dict[str, Any] = {}
+    missing_required: List[str] = []
+
+    for f in fields(cls):
+        if f.name in data:
+            kwargs[f.name] = data[f.name]
+            continue
+
+        has_default = f.default is not MISSING
+        has_default_factory = getattr(f, "default_factory", MISSING) is not MISSING  # type: ignore[attr-defined]
+        if has_default or has_default_factory:
+            continue
+
+        missing_required.append(f.name)
+
+    if missing_required:
+        raise RuntimeError(
+            f"RunManifest schema mismatch: missing required fields {missing_required}. "
+            f"Update cli.py manifest data to include these fields."
+        )
+    return cls(**kwargs)
+
+
+def _ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+# =========================
+# M1 parsing (dentro do CLI)
+# =========================
+
+@dataclass(frozen=True)
+class _RawItem:
+    bl_itemtype: str
+    bl_part_id: str
+    bl_color_id: Optional[int]
+    qty: int
+    condition: str
+
+
+def _get_text(parent: ET.Element, tag: str) -> Optional[str]:
+    el = parent.find(tag)
+    if el is None or el.text is None:
+        return None
+    s = el.text.strip()
+    return s if s else None
+
+
+def _parse_search_xml(path: str) -> List[_RawItem]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"search.xml not found: {path}")
+
+    txt = p.read_text(encoding="utf-8", errors="replace").strip()
+    if not txt:
+        raise ValueError(f"search.xml is empty: {path}")
+
+    try:
+        root = ET.fromstring(txt)
+    except ET.ParseError:
+        # muitos exportes vêm sem root — embrulhar
+        root = ET.fromstring(f"<ROOT>\n{txt}\n</ROOT>")
+
+    out: List[_RawItem] = []
+    for item in root.findall(".//ITEM"):
+        part_id = _get_text(item, "ITEMID")
+        itemtype = (_get_text(item, "ITEMTYPE") or "P").strip().upper()
+        color_raw = _get_text(item, "COLOR")
+        qty_raw = _get_text(item, "QTY")
+        cond = (_get_text(item, "CONDITION") or "N").strip().upper()
+
+        if not part_id:
+            raise ValueError("Found ITEM missing ITEMID")
+
+        try:
+            qty = int(float(qty_raw)) if qty_raw is not None else 0
+        except Exception:
+            raise ValueError(f"Invalid QTY='{qty_raw}' for ITEMID={part_id}")
+
+        if qty <= 0:
+            continue
+
+        color_id: Optional[int] = None
+        if color_raw is not None:
+            try:
+                color_id = int(color_raw)
+            except Exception:
+                raise ValueError(f"Invalid COLOR='{color_raw}' for ITEMID={part_id}")
+
+        if cond not in {"N", "U"}:
+            raise ValueError(f"Invalid CONDITION='{cond}' for ITEMID={part_id} (expected N or U)")
+
+        out.append(_RawItem(itemtype, part_id, color_id, qty, cond))
+
+    return out
+
+
+def _aggregate_items(raw: List[_RawItem]) -> List[_RawItem]:
+    agg: Dict[Tuple[str, str, Optional[int], str], int] = {}
+    for r in raw:
+        k = (r.bl_itemtype, r.bl_part_id, r.bl_color_id, r.condition)
+        agg[k] = agg.get(k, 0) + r.qty
+
+    out = [_RawItem(k[0], k[1], k[2], v, k[3]) for k, v in agg.items()]
+    out.sort(key=lambda x: (x.bl_itemtype, x.bl_part_id, -1 if x.bl_color_id is None else x.bl_color_id, x.condition))
+    return out
+
+
+def _color_match_sql() -> str:
+    return "((bl_color_id IS NULL AND ? IS NULL) OR (bl_color_id = ?))"
+
+
+def _lookup_override(con, it: _RawItem) -> Optional[int]:
+    q = f"""
+      SELECT bo_boid
+      FROM mapping_overrides
+      WHERE bl_itemtype = ?
+        AND bl_part_id = ?
+        AND {_color_match_sql()}
+      LIMIT 1;
+    """
+    row = con.execute(q, (it.bl_itemtype, it.bl_part_id, it.bl_color_id, it.bl_color_id)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def _lookup_upstream(con, it: _RawItem) -> Tuple[Optional[int], Optional[int]]:
+    q = f"""
+      SELECT bo_boid, weight_mg
+      FROM up_mapping_mirror
+      WHERE bl_itemtype = ?
+        AND bl_part_id = ?
+        AND {_color_match_sql()}
+      LIMIT 1;
+    """
+    row = con.execute(q, (it.bl_itemtype, it.bl_part_id, it.bl_color_id, it.bl_color_id)).fetchone()
+    if row is None:
+        return None, None
+    boid = row[0]
+    wmg = row[1]
+    try:
+        boid_i = int(boid) if boid is not None else None
+    except Exception:
+        boid_i = None
+    try:
+        wmg_i = int(wmg) if wmg is not None else None
+    except Exception:
+        wmg_i = None
+    return boid_i, wmg_i
+
+
+def _lookup_weight_fallback(con, it: _RawItem) -> Optional[int]:
+    q = """
+      SELECT weight_mg
+      FROM up_mapping_mirror
+      WHERE bl_itemtype = ?
+        AND bl_part_id = ?
+        AND weight_mg IS NOT NULL
+        AND weight_mg > 0
+      LIMIT 1;
+    """
+    row = con.execute(q, (it.bl_itemtype, it.bl_part_id)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def _ensure_fill_later(con, it: _RawItem, reason: str) -> bool:
+    now = utc_now_iso()
+    q = """
+      INSERT OR IGNORE INTO mapping_overrides
+        (bl_itemtype, bl_part_id, bl_color_id, bo_boid, status, reason, created_ts, updated_ts)
+      VALUES
+        (?, ?, ?, NULL, 'fill_later', ?, ?, ?);
+    """
+    cur = con.execute(q, (it.bl_itemtype, it.bl_part_id, it.bl_color_id, reason, now, now))
+    return cur.rowcount == 1
+
+
+# =========================
+# Commands
+# =========================
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    repo_root = cfg.paths.repo_root
+
     run_id = args.run_id or make_run_id()
-    slice_id = args.slice_id or "0"
-    logger = JsonlLogger(cfg.paths.logs_dir, run_id, slice_id)
+    slice_id = args.slice_id
 
     lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds)
-    try:
-        lock.acquire(owner_run_id=run_id, owner_info={"slice_id": slice_id}, wait_seconds=args.lock_wait_seconds)
-    except RepoLockError as e:
-        raise SystemExit(str(e))
+    logger = JsonlLogger(cfg.paths.logs_dir, run_id=run_id, slice_id=slice_id)
 
+    lock.acquire(owner_run_id=run_id, owner_info={"action": "bootstrap"}, wait_seconds=args.lock_wait_seconds)
     try:
-        logger.log("bootstrap.start", config_path=args.config)
+        logger.log("bootstrap.start", config=args.config)
 
-        Path(cfg.paths.manifests_dir).mkdir(parents=True, exist_ok=True)
-        Path(cfg.paths.logs_dir).mkdir(parents=True, exist_ok=True)
-        Path(cfg.paths.sqlite_db).parent.mkdir(parents=True, exist_ok=True)
+        # Optional: pull (apenas se não desativado)
+        if getattr(cfg.github_sync, "enabled", False) and getattr(cfg.github_sync, "pull", False) and not args.no_pull:
+            logger.log("git.pull.start")
+            # sync_repo exige commit_message; passamos dummy e do_commit/do_push False
+            sync_repo(
+                repo_root=cfg.paths.repo_root,
+                do_pull=True,
+                do_commit=False,
+                do_push=False,
+                commit_message="brickovery: pull-only",
+                user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
+                user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
+                fail_safe_on_push_conflict=getattr(cfg.github_sync, "fail_safe_on_push_conflict", True),
+            )
+            logger.log("git.pull.done")
 
         con = connect(cfg.paths.sqlite_db)
         migrate(con)
         logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
 
-        schema_hint = cfg.upstream.schema_hint.model_dump()
+        schema_hint = {}
+        if hasattr(cfg.upstream, "schema_hint") and cfg.upstream.schema_hint:
+            schema_hint = cfg.upstream.schema_hint
+
+        upstream_checkout_path = getattr(cfg.upstream, "checkout_path", None) or args.upstream_checkout_path
+
         up_res = ingest_upstream_mapping(
             con_work=con,
-            upstream_checkout_path=cfg.upstream.checkout_path,
+            upstream_checkout_path=upstream_checkout_path,
             upstream_db_relpath=cfg.upstream.db_relpath,
             upstream_repo=cfg.upstream.repo,
             upstream_ref=cfg.upstream.ref,
@@ -59,147 +279,34 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         )
         logger.log("upstream.ingested", **up_res)
 
-        sh_hash, sh_n = ingest_shipping_bands(
-            con, cfg.tables.shipping_normal_txt, service_level="NORMAL", dest_country="PT"
-        )
-        logger.log(
-            "shipping.ingested",
-            service_level="NORMAL",
-            bands=sh_n,
-            source_hash=sh_hash,
-            path=cfg.tables.shipping_normal_txt,
-        )
+        # Shipping
+        sn_hash, sn_n = ingest_shipping_bands(con, cfg.tables.shipping_normal_txt, service_level="normal", dest_country="PT")
+        logger.log("shipping.ingested", service_level="normal", bands=sn_n, source_hash=sn_hash)
 
-        sh2_hash, sh2_n = ingest_shipping_bands(
-            con, cfg.tables.shipping_registered_txt, service_level="REGISTERED", dest_country="PT"
-        )
-        logger.log(
-            "shipping.ingested",
-            service_level="REGISTERED",
-            bands=sh2_n,
-            source_hash=sh2_hash,
-            path=cfg.tables.shipping_registered_txt,
-        )
+        sr_hash, sr_n = ingest_shipping_bands(con, cfg.tables.shipping_registered_txt, service_level="registered", dest_country="PT")
+        logger.log("shipping.ingested", service_level="registered", bands=sr_n, source_hash=sr_hash)
 
-        rr_hash, rr_rules = ingest_rarity_rules(con, cfg.tables.rarity_rules_txt)
-        logger.log(
-            "rarity_rules.ingested",
-            rules_hash=rr_hash,
-            parsed_rules=rr_rules,
-            path=cfg.tables.rarity_rules_txt,
-        )
+        # Rarity rules
+        rr_hash, rr_n = ingest_rarity_rules(con, cfg.tables.rarity_rules_txt)
+        logger.log("rarity.ingested", rules=rr_n, source_hash=rr_hash)
 
-        cfg_hash = sha256_json(cfg.raw)
-        manifest = RunManifest(
-            run_id=run_id,
-            slice_id=slice_id,
-            created_ts=utc_now_iso(),
-            config_hash=cfg_hash,
-            upstream_repo=cfg.upstream.repo,
-            upstream_ref=cfg.upstream.ref,
-            upstream_commit_sha=up_res["upstream_commit_sha"],
-            upstream_db_relpath=cfg.upstream.db_relpath,
-            upstream_db_sha256=up_res["upstream_db_sha256"],
-            notes="M0 bootstrap",
-        )
-        manifest_path = write_manifest(manifest, cfg.paths.manifests_dir)
-
-        con.execute(
-            "INSERT OR REPLACE INTO run_manifest(run_id, slice_id, manifest_json, created_ts) VALUES(?,?,?,?);",
-            (run_id, slice_id, Path(manifest_path).read_text(encoding="utf-8"), utc_now_iso()),
-        )
-        con.commit()
-        con.close()
-        logger.log("manifest.written", path=str(manifest_path))
-
-        def cmd_normalize_input(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-
-    run_id = args.run_id or make_run_id()
-    slice_id = args.slice_id
-
-    lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds, wait_seconds=args.lock_wait_seconds)
-    logger = JsonlLogger(cfg.paths.logs_dir, run_id=run_id, slice_id=slice_id)
-
-    try:
-        lock.acquire()
-        logger.log("normalize.start", config_path=args.config, input_path=args.input)
-
-        con = connect(cfg.paths.sqlite_db)
-        migrate(con)
-        logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
-
-        raw = parse_search_xml(args.input)
-        logger.log("normalize.parsed", raw_items=len(raw))
-
-        requested = aggregate_requested(raw)
-        logger.log("normalize.aggregated", requested_items=len(requested))
-
-        normalized, stats, total_weight_mg = normalize_items(con, requested)
-        norm_hash = normalized_items_hash(normalized)
-
-        out_dir = Path(args.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        normalized_path = out_dir / f"normalized_items.{run_id}.json"
-        normalized_path.write_text(json.dumps([x.__dict__ for x in normalized], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        input_sha = sha256_file(args.input)
-        norm_sha = sha256_file(str(normalized_path))
-
-        # Input manifest separado (para consumo do solver)
-        input_manifest = {
+        # Manifest (compatível com diferentes versões do dataclass)
+        cfg_hash = sha256_json(_cfg_to_dict(cfg))
+        manifest_data = {
             "run_id": run_id,
             "slice_id": slice_id,
             "created_ts": utc_now_iso(),
-            "input_path": args.input,
-            "input_sha256": input_sha,
-            "normalized_items_path": str(normalized_path),
-            "normalized_items_sha256": norm_sha,
-            "normalized_items_hash": norm_hash,
-            "stats": stats,
-            "total_weight_mg": total_weight_mg,
+            "config_hash": cfg_hash,
+            "upstream_repo": cfg.upstream.repo,
+            "upstream_ref": cfg.upstream.ref,
+            "upstream_commit_sha": up_res.get("upstream_commit_sha", ""),
+            "upstream_db_relpath": cfg.upstream.db_relpath,
+            "upstream_db_sha256": up_res.get("upstream_db_sha256", ""),
+            "notes": "M0 bootstrap",
         }
-        input_manifest["manifest_hash"] = sha256_json(input_manifest)
+        manifest_obj = _build_dataclass_instance(RunManifest, manifest_data)
+        manifest_path = write_manifest(manifest_obj, cfg.paths.manifests_dir)
 
-        input_manifest_path = out_dir / f"input_manifest.{run_id}.json"
-        input_manifest_path.write_text(json.dumps(input_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        # incluir no RunManifest para auditoria unificada
-        cfg_hash = sha256_json(cfg.raw)
-
-        # recuperar upstream info do último manifest (já ingerido no M0)
-        up = con.execute("SELECT manifest_json FROM run_manifest ORDER BY created_ts DESC LIMIT 1;").fetchone()
-        upstream_commit_sha = cfg.upstream.ref
-        upstream_db_sha256 = ""
-        if up is not None:
-            try:
-                last = json.loads(up[0])
-                upstream_commit_sha = last.get("upstream_commit_sha", upstream_commit_sha)
-                upstream_db_sha256 = last.get("upstream_db_sha256", upstream_db_sha256)
-            except Exception:
-                pass
-
-        manifest = RunManifest(
-            run_id=run_id,
-            slice_id=slice_id,
-            created_ts=utc_now_iso(),
-            config_hash=cfg_hash,
-            upstream_repo=cfg.upstream.repo,
-            upstream_ref=cfg.upstream.ref,
-            upstream_commit_sha=upstream_commit_sha,
-            upstream_db_relpath=cfg.upstream.db_relpath,
-            upstream_db_sha256=upstream_db_sha256,
-            notes="M1 normalize-input",
-            input_path=args.input,
-            input_sha256=input_sha,
-            input_items_hash=norm_hash,
-            normalized_items_path=str(normalized_path),
-            normalized_items_sha256=norm_sha,
-            missing_mapping_count=stats.get("missing_boid", 0),
-            total_weight_mg=total_weight_mg,
-        )
-        manifest_path = write_manifest(manifest, cfg.paths.manifests_dir)
         con.execute(
             "INSERT OR REPLACE INTO run_manifest(run_id, slice_id, manifest_json, created_ts) VALUES(?,?,?,?);",
             (run_id, slice_id, Path(manifest_path).read_text(encoding="utf-8"), utc_now_iso()),
@@ -207,59 +314,35 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         con.commit()
         con.close()
 
-        logger.log("normalize.done", **stats, total_weight_mg=total_weight_mg, output_dir=str(out_dir))
-        logger.log("manifest.written", path=str(manifest_path))
-        logger.log("input_manifest.written", path=str(input_manifest_path))
+        logger.log("bootstrap.done", run_id=run_id, slice_id=slice_id, manifest_path=str(manifest_path))
+
+        # Optional: commit/push (apenas se não desativado)
+        if getattr(cfg.github_sync, "enabled", False) and not args.no_commit:
+            msg_tmpl = getattr(cfg.github_sync, "commit_message_template", "brickovery: {action} (run_id={run_id}, slice_id={slice_id})")
+            msg = msg_tmpl.format(
+                action="bootstrap",
+                run_id=run_id,
+                slice_id=slice_id,
+                upstream_commit_sha=up_res.get("upstream_commit_sha", ""),
+            )
+            do_push = bool(getattr(cfg.github_sync, "push", False)) and not args.no_push
+            sync_res = sync_repo(
+                repo_root=cfg.paths.repo_root,
+                do_pull=False,
+                do_commit=bool(getattr(cfg.github_sync, "commit", True)),
+                do_push=do_push,
+                commit_message=msg,
+                user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
+                user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
+                fail_safe_on_push_conflict=getattr(cfg.github_sync, "fail_safe_on_push_conflict", True),
+            )
+            logger.log("git.sync.done", status=sync_res.status, did_commit=sync_res.did_commit, did_push=sync_res.did_push)
+
         return 0
 
     finally:
         lock.release()
 
-        # -------------------------
-        # Git sync (optional)
-        # -------------------------
-        if cfg.github_sync.enabled:
-            do_pull = cfg.github_sync.pull and not args.no_pull
-            do_commit = cfg.github_sync.commit and not args.no_commit
-            do_push = cfg.github_sync.push and not args.no_push
-
-            if not (do_pull or do_commit or do_push):
-                logger.log("git.sync.skipped", reason="all git operations disabled by flags")
-            else:
-                msg = cfg.github_sync.commit_message_template.format(
-                    action="bootstrap",
-                    run_id=run_id,
-                    slice_id=slice_id,
-                    upstream_commit_sha=up_res["upstream_commit_sha"],
-                )
-                res = sync_repo(
-                    repo_root=repo_root,
-                    do_pull=do_pull,
-                    do_commit=do_commit,
-                    do_push=do_push,
-                    commit_message=msg,
-                    user_name=cfg.github_sync.git_user_name,
-                    user_email=cfg.github_sync.git_user_email,
-                    fail_safe_on_push_conflict=cfg.github_sync.fail_safe_on_push_conflict,
-                )
-                logger.log("git.sync", did_commit=res.did_commit, did_push=res.did_push, status=res.status)
-
-        logger.log("bootstrap.done", run_id=run_id, slice_id=slice_id)
-        return 0
-
-    except Exception as e:
-        logger.log("bootstrap.error", exc_type=type(e).__name__, error=str(e))
-        raise
-
-    finally:
-        # Liberta lock sem rebentar caso a implementação não tenha release()
-        rel = getattr(lock, "release", None)
-        if callable(rel):
-            try:
-                rel()
-            except Exception:
-                # Não mascara erros do bootstrap
-                pass
 
 def cmd_normalize_input(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
@@ -267,36 +350,87 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
     run_id = args.run_id or make_run_id()
     slice_id = args.slice_id
 
-    lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds, wait_seconds=args.lock_wait_seconds)
+    lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds)
     logger = JsonlLogger(cfg.paths.logs_dir, run_id=run_id, slice_id=slice_id)
 
+    lock.acquire(owner_run_id=run_id, owner_info={"action": "normalize-input"}, wait_seconds=args.lock_wait_seconds)
     try:
-        lock.acquire()
-        logger.log("normalize.start", config_path=args.config, input_path=args.input)
+        logger.log("normalize.start", input_path=args.input)
 
         con = connect(cfg.paths.sqlite_db)
         migrate(con)
-        logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
 
-        raw = parse_search_xml(args.input)
-        logger.log("normalize.parsed", raw_items=len(raw))
+        raw = _parse_search_xml(args.input)
+        requested = _aggregate_items(raw)
 
-        requested = aggregate_requested(raw)
-        logger.log("normalize.aggregated", requested_items=len(requested))
+        stats = {
+            "raw_items": len(raw),
+            "requested_items": len(requested),
+            "mapped_ok": 0,
+            "missing_boid": 0,
+            "weight_ok": 0,
+            "missing_weight": 0,
+            "overrides_created": 0,
+        }
 
-        normalized, stats, total_weight_mg = normalize_items(con, requested)
-        norm_hash = normalized_items_hash(normalized)
+        normalized: List[Dict[str, Any]] = []
+        total_weight_mg = 0
 
+        for it in requested:
+            boid = _lookup_override(con, it)
+            mapping_source = "override" if boid is not None else "none"
+
+            up_boid, up_wmg = _lookup_upstream(con, it)
+            if boid is None and up_boid is not None:
+                boid = up_boid
+                mapping_source = "upstream"
+
+            weight_mg = up_wmg if up_wmg is not None else _lookup_weight_fallback(con, it)
+
+            mapping_status = "OK" if boid is not None else "MISSING_BOID"
+            weight_status = "OK" if (weight_mg is not None and weight_mg > 0) else "MISSING_WEIGHT"
+
+            if mapping_status == "OK":
+                stats["mapped_ok"] += 1
+            else:
+                stats["missing_boid"] += 1
+                if _ensure_fill_later(con, it, reason="missing boid in upstream/override"):
+                    stats["overrides_created"] += 1
+
+            if weight_status == "OK":
+                stats["weight_ok"] += 1
+                total_weight_mg += int(weight_mg) * int(it.qty)
+            else:
+                stats["missing_weight"] += 1
+
+            normalized.append(
+                {
+                    "bl_itemtype": it.bl_itemtype,
+                    "bl_part_id": it.bl_part_id,
+                    "bl_color_id": it.bl_color_id,
+                    "condition": it.condition,
+                    "qty": it.qty,
+                    "bo_boid": boid,
+                    "weight_mg": weight_mg,
+                    "mapping_source": mapping_source,
+                    "mapping_status": mapping_status,
+                    "weight_status": weight_status,
+                }
+            )
+
+        con.commit()
+
+        # outputs
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         normalized_path = out_dir / f"normalized_items.{run_id}.json"
-        normalized_path.write_text(json.dumps([x.__dict__ for x in normalized], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        normalized_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         input_sha = sha256_file(args.input)
-        norm_sha = sha256_file(str(normalized_path))
+        normalized_sha = sha256_file(str(normalized_path))
+        normalized_hash = sha256_json({"items": normalized})
 
-        # Input manifest separado (para consumo do solver)
         input_manifest = {
             "run_id": run_id,
             "slice_id": slice_id,
@@ -304,8 +438,8 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "input_path": args.input,
             "input_sha256": input_sha,
             "normalized_items_path": str(normalized_path),
-            "normalized_items_sha256": norm_sha,
-            "normalized_items_hash": norm_hash,
+            "normalized_items_sha256": normalized_sha,
+            "normalized_items_hash": normalized_hash,
             "stats": stats,
             "total_weight_mg": total_weight_mg,
         }
@@ -314,41 +448,31 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         input_manifest_path = out_dir / f"input_manifest.{run_id}.json"
         input_manifest_path.write_text(json.dumps(input_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-        # incluir no RunManifest para auditoria unificada
-        cfg_hash = sha256_json(cfg.raw)
+        # Run manifest (compatível)
+        cfg_hash = sha256_json(_cfg_to_dict(cfg))
+        manifest_data = {
+            "run_id": run_id,
+            "slice_id": slice_id,
+            "created_ts": utc_now_iso(),
+            "config_hash": cfg_hash,
+            "notes": "M1 normalize-input",
+            "input_path": args.input,
+            "input_sha256": input_sha,
+            "input_items_hash": normalized_hash,
+            "normalized_items_path": str(normalized_path),
+            "normalized_items_sha256": normalized_sha,
+            "missing_mapping_count": stats["missing_boid"],
+            "total_weight_mg": total_weight_mg,
+            # upstream fields se o dataclass exigir
+            "upstream_repo": getattr(cfg.upstream, "repo", ""),
+            "upstream_ref": getattr(cfg.upstream, "ref", ""),
+            "upstream_commit_sha": getattr(cfg.upstream, "ref", ""),
+            "upstream_db_relpath": getattr(cfg.upstream, "db_relpath", ""),
+            "upstream_db_sha256": "",
+        }
+        manifest_obj = _build_dataclass_instance(RunManifest, manifest_data)
+        manifest_path = write_manifest(manifest_obj, cfg.paths.manifests_dir)
 
-        # recuperar upstream info do último manifest (já ingerido no M0)
-        up = con.execute("SELECT manifest_json FROM run_manifest ORDER BY created_ts DESC LIMIT 1;").fetchone()
-        upstream_commit_sha = cfg.upstream.ref
-        upstream_db_sha256 = ""
-        if up is not None:
-            try:
-                last = json.loads(up[0])
-                upstream_commit_sha = last.get("upstream_commit_sha", upstream_commit_sha)
-                upstream_db_sha256 = last.get("upstream_db_sha256", upstream_db_sha256)
-            except Exception:
-                pass
-
-        manifest = RunManifest(
-            run_id=run_id,
-            slice_id=slice_id,
-            created_ts=utc_now_iso(),
-            config_hash=cfg_hash,
-            upstream_repo=cfg.upstream.repo,
-            upstream_ref=cfg.upstream.ref,
-            upstream_commit_sha=upstream_commit_sha,
-            upstream_db_relpath=cfg.upstream.db_relpath,
-            upstream_db_sha256=upstream_db_sha256,
-            notes="M1 normalize-input",
-            input_path=args.input,
-            input_sha256=input_sha,
-            input_items_hash=norm_hash,
-            normalized_items_path=str(normalized_path),
-            normalized_items_sha256=norm_sha,
-            missing_mapping_count=stats.get("missing_boid", 0),
-            total_weight_mg=total_weight_mg,
-        )
-        manifest_path = write_manifest(manifest, cfg.paths.manifests_dir)
         con.execute(
             "INSERT OR REPLACE INTO run_manifest(run_id, slice_id, manifest_json, created_ts) VALUES(?,?,?,?);",
             (run_id, slice_id, Path(manifest_path).read_text(encoding="utf-8"), utc_now_iso()),
@@ -356,30 +480,36 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         con.commit()
         con.close()
 
-        logger.log("normalize.done", **stats, total_weight_mg=total_weight_mg, output_dir=str(out_dir))
-        logger.log("manifest.written", path=str(manifest_path))
-        logger.log("input_manifest.written", path=str(input_manifest_path))
+        logger.log("normalize.done", **stats, total_weight_mg=total_weight_mg, normalized_path=str(normalized_path), input_manifest_path=str(input_manifest_path))
         return 0
 
     finally:
         lock.release()
 
 
+# =========================
+# Parser
+# =========================
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="brickovery")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("bootstrap", help="M0 bootstrap")
+    # M0
+    b = sub.add_parser("bootstrap", help="M0: ingest upstream mapping + shipping bands + rarity rules")
     b.add_argument("--config", required=True)
     b.add_argument("--run-id", default=None)
     b.add_argument("--slice-id", default="0")
+    b.add_argument("--upstream-checkout-path", default="upstream/amauri-repo")
     b.add_argument("--no-pull", action="store_true")
     b.add_argument("--no-commit", action="store_true")
     b.add_argument("--no-push", action="store_true")
     b.add_argument("--lock-ttl-seconds", type=int, default=3600)
     b.add_argument("--lock-wait-seconds", type=int, default=0)
     b.set_defaults(func=cmd_bootstrap)
-    n = sub.add_parser("normalize-input", help="M1 parse + normalize search.xml")
+
+    # M1
+    n = sub.add_parser("normalize-input", help="M1: parse + normalize search.xml (creates overrides if missing BOID)")
     n.add_argument("--config", required=True)
     n.add_argument("--input", default="inputs/search.xml")
     n.add_argument("--output-dir", default="outputs/inputs")
@@ -395,7 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
