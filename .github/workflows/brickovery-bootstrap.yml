@@ -83,15 +83,90 @@ jobs:
             --no-commit \
             --no-push
 
-      - name: Git diagnostics (after bootstrap)
+      - name: Build upstream schema report (creates upstream_schema_report.txt)
         working-directory: repo
-        if: always()
         run: |
           set -euo pipefail
-          pwd
-          git rev-parse --is-inside-work-tree
-          git status --porcelain
-          git remote -v
+          python - <<'PY'
+          import sqlite3, os
+
+          db_path = "upstream/amauri-repo/data base/brickovery.db"
+          con = sqlite3.connect(db_path)
+          con.row_factory = sqlite3.Row
+
+          def tables():
+              return [r["name"] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+              )]
+
+          def cols(t):
+              return [r["name"] for r in con.execute(f"PRAGMA table_info('{t}');")]
+
+          def pick(columns, keys):
+              for c in columns:
+                  cl = c.lower()
+                  if any(k in cl for k in keys):
+                      return c
+              return None
+
+          def nn_count(t, col, limit=80000):
+              if not col:
+                  return 0
+              q = f"""
+                SELECT SUM(CASE WHEN {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT))!='' THEN 1 ELSE 0 END) AS nn
+                FROM (SELECT {col} FROM '{t}' LIMIT {limit});
+              """
+              try:
+                  return int(con.execute(q).fetchone()["nn"] or 0)
+              except Exception:
+                  return 0
+
+          candidates = []
+          for t in tables():
+              c = cols(t)
+              low = [x.lower() for x in c]
+
+              # só considerar tabelas com indícios de BOID/BrickOwl ou Weight
+              if not any("boid" in x or "brickowl" in x for x in low) and not any("weight" in x or "gram" in x or "mass" in x for x in low):
+                  continue
+
+              boid_col = pick(c, ["boid""])
+              w_col    = pick(c, ["weight"])
+              bl_part  = pick(c, ["bl_part_id"])
+              bl_color = pick(c, ["bl_color_id"])
+              it_type  = pick(c, ["item_type"])
+
+              nn_boid = nn_count(t, boid_col)
+              nn_w    = nn_count(t, w_col)
+
+              score = 0
+              score += 10 if nn_boid > 0 else 0
+              score +=  5 if nn_w > 0 else 0
+              score +=  2 if bl_part else 0
+              score +=  1 if bl_color else 0
+              score +=  1 if it_type else 0
+
+              candidates.append((score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type))
+
+          candidates.sort(reverse=True)
+
+          out = []
+          out.append("UPSTREAM SCHEMA REPORT")
+          out.append(f"db_path: {db_path}")
+          out.append("")
+          out.append("TOP CANDIDATES (ordered by score, nn_boid(sample), nn_weight(sample))")
+          out.append("score | nn_boid | nn_weight | table | boid_col | weight_col | bl_part_col | bl_color_col | bl_itemtype_col")
+          out.append("-"*120)
+          for score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type in candidates[:25]:
+              out.append(f"{score:>5} | {nn_boid:>7} | {nn_w:>9} | {t} | {boid_col} | {w_col} | {bl_part} | {bl_color} | {it_type}")
+
+          os.makedirs("data base", exist_ok=True)
+          with open("data base/upstream_schema_report.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+
+          con.close()
+          print("Wrote: data base/upstream_schema_report.txt")
+          PY
 
       - name: Commit and push outputs (controlled)
         working-directory: repo
@@ -99,8 +174,6 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Ensure origin uses token auth for push
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
           if [ -n "$(git status --porcelain)" ]; then
@@ -120,4 +193,5 @@ jobs:
             repo/data base/logs
             repo/data base/manifests
             repo/data base/brickovery.db
+            repo/data base/upstream_schema_report.txt
           if-no-files-found: warn
