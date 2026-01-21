@@ -1,0 +1,79 @@
+name: Brickovery - M1 Normalize Input
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: brickovery-m1-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone repo manually
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify input exists
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la inputs || true
+          test -f inputs/search.xml
+
+      - name: Run M1 normalize-input
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+
+      - name: Commit and push outputs (controlled)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "brickovery: M1 normalize-input (run_id=${{ github.run_id }})"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m1
+          path: |
+            repo/outputs/inputs
+            repo/data base/logs
+            repo/data base/manifests
+            repo/data base/brickovery.db
+          if-no-files-found: warn
