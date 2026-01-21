@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, fields, MISSING
 from pathlib import Path
@@ -21,40 +22,26 @@ from .ingest.shipping import ingest_shipping_bands
 from .ingest.rarity_rules import ingest_rarity_rules
 
 
-# =========================
-# Helpers (robustos)
-# =========================
-
 def _cfg_to_dict(cfg: Any) -> Dict[str, Any]:
-    """Extrai um dict estável do cfg para hashing/auditoria, sem depender do formato interno."""
     if hasattr(cfg, "raw") and isinstance(getattr(cfg, "raw"), dict) and cfg.raw:
         return dict(cfg.raw)
     if hasattr(cfg, "model_dump"):
         return cfg.model_dump()
-    # fallback extremo
     return json.loads(json.dumps(cfg, default=str))
 
 
 def _build_dataclass_instance(cls: Any, data: Dict[str, Any]) -> Any:
-    """
-    Constrói um dataclass (RunManifest) de forma compatível mesmo se o schema do dataclass variar.
-    Só passa campos existentes; falha com mensagem clara se faltar algum campo obrigatório.
-    """
     kwargs: Dict[str, Any] = {}
     missing_required: List[str] = []
-
     for f in fields(cls):
         if f.name in data:
             kwargs[f.name] = data[f.name]
             continue
-
         has_default = f.default is not MISSING
         has_default_factory = getattr(f, "default_factory", MISSING) is not MISSING  # type: ignore[attr-defined]
         if has_default or has_default_factory:
             continue
-
         missing_required.append(f.name)
-
     if missing_required:
         raise RuntimeError(
             f"RunManifest schema mismatch: missing required fields {missing_required}. "
@@ -64,16 +51,13 @@ def _build_dataclass_instance(cls: Any, data: Dict[str, Any]) -> Any:
 
 
 def _schema_hint_to_dict(hint_obj: Any) -> Dict[str, Any]:
-    """Converte schema_hint (dict ou Pydantic) para dict puro."""
     if not hint_obj:
         return {}
     if isinstance(hint_obj, dict):
         return hint_obj
     if hasattr(hint_obj, "model_dump"):
-        # Pydantic v2
         return hint_obj.model_dump()
     if hasattr(hint_obj, "dict"):
-        # Pydantic v1
         return hint_obj.dict()
     try:
         return dict(hint_obj)
@@ -81,9 +65,13 @@ def _schema_hint_to_dict(hint_obj: Any) -> Dict[str, Any]:
         return {}
 
 
-# =========================
-# M1 parsing (dentro do CLI)
-# =========================
+def _normalize_boid(v: Any) -> Optional[str]:
+    # BOID pode ser TXT (ex.: "656416-20"). Guardar exatamente.
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
 
 @dataclass(frozen=True)
 class _RawItem:
@@ -107,46 +95,82 @@ def _parse_search_xml(path: str) -> List[_RawItem]:
     if not p.exists():
         raise FileNotFoundError(f"search.xml not found: {path}")
 
-    txt = p.read_text(encoding="utf-8", errors="replace").strip()
+    txt = p.read_text(encoding="utf-8", errors="replace")
+    txt = txt.lstrip("\ufeff").strip()
     if not txt:
         raise ValueError(f"search.xml is empty: {path}")
 
+    last_err: Optional[Exception] = None
+
+    def parse_from_root(root: ET.Element) -> List[_RawItem]:
+        out: List[_RawItem] = []
+        for item in root.findall(".//ITEM"):
+            part_id = _get_text(item, "ITEMID")
+            itemtype = (_get_text(item, "ITEMTYPE") or "P").strip().upper()
+            color_raw = _get_text(item, "COLOR")
+            qty_raw = _get_text(item, "QTY")
+            cond = (_get_text(item, "CONDITION") or "N").strip().upper()
+
+            if not part_id:
+                raise ValueError("Found ITEM missing ITEMID")
+
+            try:
+                qty = int(float(qty_raw)) if qty_raw is not None else 0
+            except Exception:
+                raise ValueError(f"Invalid QTY='{qty_raw}' for ITEMID={part_id}")
+
+            if qty <= 0:
+                continue
+
+            color_id: Optional[int] = None
+            if color_raw is not None:
+                try:
+                    color_id = int(color_raw)
+                except Exception:
+                    raise ValueError(f"Invalid COLOR='{color_raw}' for ITEMID={part_id}")
+
+            if cond not in {"N", "U"}:
+                raise ValueError(f"Invalid CONDITION='{cond}' for ITEMID={part_id} (expected N or U)")
+
+            out.append(_RawItem(itemtype, part_id, color_id, qty, cond))
+
+        return out
+
     try:
         root = ET.fromstring(txt)
-    except ET.ParseError:
-        # muitos exportes vêm sem root — embrulhar
+        return parse_from_root(root)
+    except ET.ParseError as e:
+        last_err = e
+
+    try:
         root = ET.fromstring(f"<ROOT>\n{txt}\n</ROOT>")
+        return parse_from_root(root)
+    except ET.ParseError as e:
+        last_err = e
+
+    blocks = re.findall(r"<ITEM\b[^>]*>.*?</ITEM>", txt, flags=re.DOTALL | re.IGNORECASE)
+    if not blocks:
+        raise ValueError(
+            "search.xml is not valid XML and no <ITEM>...</ITEM> blocks could be extracted."
+        ) from last_err
 
     out: List[_RawItem] = []
-    for item in root.findall(".//ITEM"):
-        part_id = _get_text(item, "ITEMID")
-        itemtype = (_get_text(item, "ITEMTYPE") or "P").strip().upper()
-        color_raw = _get_text(item, "COLOR")
-        qty_raw = _get_text(item, "QTY")
-        cond = (_get_text(item, "CONDITION") or "N").strip().upper()
+    errors: List[str] = []
 
-        if not part_id:
-            raise ValueError("Found ITEM missing ITEMID")
-
+    for i, b in enumerate(blocks[:50000]):
         try:
-            qty = int(float(qty_raw)) if qty_raw is not None else 0
-        except Exception:
-            raise ValueError(f"Invalid QTY='{qty_raw}' for ITEMID={part_id}")
+            el = ET.fromstring(b)
+            virtual = ET.Element("ROOT")
+            virtual.append(el)
+            out.extend(parse_from_root(virtual))
+        except Exception as ex:
+            errors.append(f"block#{i}: {type(ex).__name__}: {ex}")
 
-        if qty <= 0:
-            continue
-
-        color_id: Optional[int] = None
-        if color_raw is not None:
-            try:
-                color_id = int(color_raw)
-            except Exception:
-                raise ValueError(f"Invalid COLOR='{color_raw}' for ITEMID={part_id}")
-
-        if cond not in {"N", "U"}:
-            raise ValueError(f"Invalid CONDITION='{cond}' for ITEMID={part_id} (expected N or U)")
-
-        out.append(_RawItem(itemtype, part_id, color_id, qty, cond))
+    if not out:
+        raise ValueError(
+            "Extracted <ITEM> blocks but none could be parsed successfully. "
+            "First errors: " + "; ".join(errors[:3])
+        ) from last_err
 
     return out
 
@@ -166,7 +190,7 @@ def _color_match_sql() -> str:
     return "((bl_color_id IS NULL AND ? IS NULL) OR (bl_color_id = ?))"
 
 
-def _lookup_override(con, it: _RawItem) -> Optional[int]:
+def _lookup_override(con, it: _RawItem) -> Optional[str]:
     q = f"""
       SELECT bo_boid
       FROM mapping_overrides
@@ -178,13 +202,10 @@ def _lookup_override(con, it: _RawItem) -> Optional[int]:
     row = con.execute(q, (it.bl_itemtype, it.bl_part_id, it.bl_color_id, it.bl_color_id)).fetchone()
     if row is None or row[0] is None:
         return None
-    try:
-        return int(row[0])
-    except Exception:
-        return None
+    return _normalize_boid(row[0])
 
 
-def _lookup_upstream(con, it: _RawItem) -> Tuple[Optional[int], Optional[int]]:
+def _lookup_upstream(con, it: _RawItem) -> Tuple[Optional[str], Optional[int]]:
     q = f"""
       SELECT bo_boid, weight_mg
       FROM up_mapping_mirror
@@ -197,17 +218,14 @@ def _lookup_upstream(con, it: _RawItem) -> Tuple[Optional[int], Optional[int]]:
     if row is None:
         return None, None
 
+    boid_s = _normalize_boid(row[0])
+    wmg = row[1]
     try:
-        boid_i = int(row[0]) if row[0] is not None else None
-    except Exception:
-        boid_i = None
-
-    try:
-        wmg_i = int(row[1]) if row[1] is not None else None
+        wmg_i = int(wmg) if wmg is not None else None
     except Exception:
         wmg_i = None
 
-    return boid_i, wmg_i
+    return boid_s, wmg_i
 
 
 def _lookup_weight_fallback(con, it: _RawItem) -> Optional[int]:
@@ -241,13 +259,21 @@ def _ensure_fill_later(con, it: _RawItem, reason: str) -> bool:
     return cur.rowcount == 1
 
 
-# =========================
-# Commands
-# =========================
+def _promote_override_to_ok(con, it: _RawItem, boid: str) -> None:
+    now = utc_now_iso()
+    q = f"""
+      UPDATE mapping_overrides
+      SET bo_boid = ?, status = 'ok', reason = NULL, updated_ts = ?
+      WHERE bl_itemtype = ?
+        AND bl_part_id = ?
+        AND {_color_match_sql()}
+        AND status = 'fill_later';
+    """
+    con.execute(q, (boid, now, it.bl_itemtype, it.bl_part_id, it.bl_color_id, it.bl_color_id))
+
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-
     run_id = args.run_id or make_run_id()
     slice_id = args.slice_id
 
@@ -258,7 +284,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     try:
         logger.log("bootstrap.start", config=args.config)
 
-        # Optional: pull
         if getattr(cfg.github_sync, "enabled", False) and getattr(cfg.github_sync, "pull", False) and not args.no_pull:
             logger.log("git.pull.start")
             sync_repo(
@@ -324,7 +349,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
         logger.log("bootstrap.done", run_id=run_id, slice_id=slice_id, manifest_path=str(manifest_path))
 
-        # Optional: commit/push
         if getattr(cfg.github_sync, "enabled", False) and not args.no_commit:
             msg_tmpl = getattr(
                 cfg.github_sync,
@@ -351,14 +375,12 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             logger.log("git.sync.done", status=sync_res.status, did_commit=sync_res.did_commit, did_push=sync_res.did_push)
 
         return 0
-
     finally:
         lock.release()
 
 
 def cmd_normalize_input(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-
     run_id = args.run_id or make_run_id()
     slice_id = args.slice_id
 
@@ -383,6 +405,7 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "weight_ok": 0,
             "missing_weight": 0,
             "overrides_created": 0,
+            "overrides_promoted": 0,
         }
 
         normalized: List[Dict[str, Any]] = []
@@ -396,6 +419,8 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             if boid is None and up_boid is not None:
                 boid = up_boid
                 mapping_source = "upstream"
+                _promote_override_to_ok(con, it, boid)
+                stats["overrides_promoted"] += 1
 
             weight_mg = up_wmg if up_wmg is not None else _lookup_weight_fallback(con, it)
 
@@ -422,7 +447,7 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                     "bl_color_id": it.bl_color_id,
                     "condition": it.condition,
                     "qty": it.qty,
-                    "bo_boid": boid,
+                    "bo_boid": boid,  # string
                     "weight_mg": weight_mg,
                     "mapping_source": mapping_source,
                     "mapping_status": mapping_status,
@@ -473,7 +498,6 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "normalized_items_sha256": normalized_sha,
             "missing_mapping_count": stats["missing_boid"],
             "total_weight_mg": total_weight_mg,
-            # upstream fields se o dataclass exigir
             "upstream_repo": getattr(cfg.upstream, "repo", ""),
             "upstream_ref": getattr(cfg.upstream, "ref", ""),
             "upstream_commit_sha": getattr(cfg.upstream, "ref", ""),
@@ -498,14 +522,9 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             input_manifest_path=str(input_manifest_path),
         )
         return 0
-
     finally:
         lock.release()
 
-
-# =========================
-# Parser
-# =========================
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="brickovery")
