@@ -40,12 +40,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Verify input exists
+      - name: Verify + diagnose inputs/search.xml
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "== inputs dir =="
           ls -la inputs || true
+          echo "== ensure file exists =="
           test -f inputs/search.xml
+          echo "== bytes =="
+          wc -c inputs/search.xml
+          echo "== first 2000 bytes =="
+          head -c 2000 inputs/search.xml || true
+          echo
+          echo "== last 2000 bytes =="
+          tail -c 2000 inputs/search.xml || true
+          echo
 
       - name: Run M1 normalize-input
         working-directory: repo
@@ -60,21 +70,6 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
-
-          DB="data base/brickovery.db"
-
-          echo "== tables =="
-          sqlite3 "$DB" ".tables"
-
-          echo "== mapping_overrides schema =="
-          sqlite3 "$DB" "PRAGMA table_info('mapping_overrides');"
-
-          echo "== up_mapping_mirror schema =="
-          sqlite3 "$DB" "PRAGMA table_info('up_mapping_mirror');"
-
-          echo "== fill_later count (if column exists) =="
           python - <<'PY'
           import sqlite3
 
@@ -82,54 +77,71 @@ jobs:
           con = sqlite3.connect(db)
           con.row_factory = sqlite3.Row
 
-          def cols(table):
-              return [r["name"] for r in con.execute(f"PRAGMA table_info('{table}')")]
+          def table_exists(name: str) -> bool:
+              return con.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                  (name,),
+              ).fetchone() is not None
 
-          tables = [
-              r["name"]
-              for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-          ]
+          def table_cols(name: str):
+              return [r["name"] for r in con.execute(f"PRAGMA table_info('{name}')")]
 
-          if "mapping_overrides" not in tables:
-              print("mapping_overrides table does not exist.")
+          print("== tables ==")
+          tables = [r["name"] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+          print("\n".join(tables))
+
+          for t in ["mapping_overrides", "up_mapping_mirror"]:
+              print(f"\n== {t} schema ==")
+              if not table_exists(t):
+                  print("MISSING TABLE")
+                  continue
+              for r in con.execute(f"PRAGMA table_info('{t}')"):
+                  print(dict(r))
+
+          if not table_exists("mapping_overrides"):
+              print("\n== fill_later check ==\nSKIP: mapping_overrides missing")
+              con.close()
               raise SystemExit(0)
 
-          c = cols("mapping_overrides")
-          if "status" not in c:
-              print("mapping_overrides has no 'status' column. Columns:", c)
+          cols = table_cols("mapping_overrides")
+          if "status" not in cols:
+              print("\n== fill_later check ==\nSKIP: mapping_overrides has no 'status' column")
+              print("columns:", cols)
+              con.close()
               raise SystemExit(0)
 
-          n = con.execute(
-              "SELECT COUNT(*) AS n FROM mapping_overrides WHERE status='fill_later'"
-          ).fetchone()["n"]
-          print("fill_later rows:", n)
+          n = con.execute("SELECT COUNT(*) AS n FROM mapping_overrides WHERE status='fill_later'").fetchone()["n"]
+          print("\n== fill_later rows ==")
+          print("count:", n)
 
-          # escolher colunas “melhor esforço” para mostrar
           preferred = [
-              "item_type",
-              "bl_part_id",
-              "bo_part_id",
-              "bl_color_id",
-              "boid",
-              "weight",
-              "status",
-              "reason",
-              "created_ts",
-              "updated_ts",
+              "bl_itemtype", "item_type",
+              "bl_part_id", "part_id",
+              "bl_color_id", "color_id",
+              "bo_boid", "boid",
+              "status", "reason",
+              "created_ts", "updated_ts",
           ]
-          show = [x for x in preferred if x in c]
+          show = [c for c in preferred if c in cols]
           if not show:
-              show = c[:8]  # fallback
+              show = cols[:8]
 
-          sql = (
-              "SELECT "
-              + ", ".join(show)
-              + " FROM mapping_overrides WHERE status='fill_later' "
-              + " ORDER BY created_ts DESC LIMIT 10"
-          )
+          order_col = None
+          for candidate in ["created_ts", "updated_ts", "rowid"]:
+              if candidate == "rowid":
+                  order_col = "rowid"
+                  break
+              if candidate in cols:
+                  order_col = candidate
+                  break
+
+          sql = f"SELECT {', '.join(show)} FROM mapping_overrides WHERE status='fill_later'"
+          if order_col:
+              sql += f" ORDER BY {order_col} DESC"
+          sql += " LIMIT 10"
+
           rows = con.execute(sql).fetchall()
-
-          print("== sample fill_later rows ==")
+          print("\n== sample fill_later rows ==")
           print("columns:", show)
           for r in rows:
               print({k: r[k] for k in show})
@@ -161,4 +173,3 @@ jobs:
             repo/data base/manifests
             repo/data base/brickovery.db
           if-no-files-found: warn
-          
