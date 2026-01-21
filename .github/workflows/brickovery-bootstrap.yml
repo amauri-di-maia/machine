@@ -130,7 +130,7 @@ jobs:
               if not any("boid" in x or "brickowl" in x for x in low) and not any("weight" in x or "gram" in x or "mass" in x for x in low):
                   continue
 
-              boid_col = pick(c, ["boid""])
+              boid_col = pick(c, ["boid"])
               w_col    = pick(c, ["weight"])
               bl_part  = pick(c, ["bl_part_id"])
               bl_color = pick(c, ["bl_color_id"])
