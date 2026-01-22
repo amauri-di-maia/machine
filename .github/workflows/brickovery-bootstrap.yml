@@ -45,9 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Keep deps minimal for M0
-          pip install -e .
-          # Ensure sqlite3 cli exists
+          pip install -r requirements.txt
           sudo apt-get update
           sudo apt-get install -y sqlite3
 
@@ -78,7 +76,8 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m brickovery.cli bootstrap --config configs/config.v1.yaml --no-push || true
+          export PYTHONPATH="$PWD"
+          python -m brickovery.cli bootstrap --config configs/config.v1.yaml
 
       - name: Upload artifacts (always)
         if: always()
