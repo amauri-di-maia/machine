@@ -247,27 +247,56 @@ class _RawItem:
 
 
 def _parse_search_xml(path: str) -> List[_RawItem]:
-    txt = _read_text(path).strip()
+    """Parse BrickLink-style search.xml (robust).
+
+    Supports:
+      - full XML documents (any root, e.g. INVENTORY)
+      - multiple <ITEM>...</ITEM> fragments concatenated (wrapped automatically)
+      - tag case variations (ITEMID vs ItemId, etc.)
+    """
+    import re  # local import to keep patch self-contained
+
+    txt = _read_text(path)
+    txt = (txt or "").lstrip("\ufeff").strip()
     if not txt:
         return []
-    # Aceita ficheiro com <INVENTORY>...</INVENTORY> OU múltiplos <ITEM> soltos.
-    try:
-        root = ET.fromstring(txt)
-    except ET.ParseError:
-        root = ET.fromstring(f"<ROOT>\n{txt}\n</ROOT>")
 
-    items = root.findall(".//ITEM") if root.tag != "ITEM" else [root]
-    out: List[_RawItem] = []
+    # Remove an XML declaration if present (important when wrapping fragments)
+    txt = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "", txt, flags=re.IGNORECASE)
 
-    for it in items:
-        part_id = (it.findtext("ITEMID") or "").strip()
-        itemtype = (it.findtext("ITEMTYPE") or "P").strip() or "P"
-        color_raw = (it.findtext("COLOR") or "").strip()
-        qty_raw = (it.findtext("QTY") or "").strip()
-        cond = (it.findtext("CONDITION") or "N").strip().upper() or "N"
+    def _local(tag: str) -> str:
+        # Strip optional namespace: {ns}TAG -> TAG
+        if "}" in tag:
+            tag = tag.split("}", 1)[1]
+        return tag
+
+    def _iter_items(root_el):
+        for el in root_el.iter():
+            if _local(el.tag).lower() == "item":
+                yield el
+
+    def _parse_item_el(el):
+        m: Dict[str, str] = {}
+        for ch in list(el):
+            k = _local(ch.tag).lower()
+            v = (ch.text or "").strip()
+            if k and v != "":
+                m[k] = v
+        # Some exports may carry values as attributes; include them too.
+        for k, v in el.attrib.items():
+            kk = _local(k).lower()
+            vv = (v or "").strip()
+            if kk and vv != "":
+                m.setdefault(kk, vv)
+
+        part_id = (m.get("itemid") or m.get("partid") or m.get("part_id") or m.get("itemno") or "").strip()
+        itemtype = (m.get("itemtype") or m.get("item_type") or m.get("type") or "P").strip() or "P"
+        color_raw = (m.get("color") or m.get("colorid") or m.get("colour") or "").strip()
+        qty_raw = (m.get("qty") or m.get("minqty") or m.get("quantity") or "").strip()
+        cond = (m.get("condition") or m.get("cond") or "N").strip().upper() or "N"
 
         if not part_id:
-            raise ValueError("Found ITEM missing ITEMID")
+            raise ValueError("Found ITEM missing ITEMID/part id")
 
         try:
             qty = int(float(qty_raw)) if qty_raw else 0
@@ -275,19 +304,49 @@ def _parse_search_xml(path: str) -> List[_RawItem]:
             raise ValueError(f"Invalid QTY='{qty_raw}' for ITEMID={part_id}") from e
 
         if qty <= 0:
-            continue
+            return None
 
         color_id: Optional[int] = None
         if color_raw:
             try:
-                color_id = int(color_raw)
+                color_id = int(float(color_raw))
             except Exception as e:
                 raise ValueError(f"Invalid COLOR='{color_raw}' for ITEMID={part_id}") from e
 
         if cond not in {"N", "U"}:
             raise ValueError(f"Invalid CONDITION='{cond}' for ITEMID={part_id} (expected N or U)")
 
-        out.append(_RawItem(itemtype, part_id, color_id, qty, cond))
+        return _RawItem(itemtype, part_id, color_id, qty, cond)
+
+    # Try: parse as complete XML; if that fails, wrap; if that fails, regex extract ITEM blocks.
+    last_err: Optional[Exception] = None
+    root = None
+    for candidate in (txt, f"<ROOT>\n{txt}\n</ROOT>"):
+        try:
+            root = ET.fromstring(candidate)
+            break
+        except ET.ParseError as e:
+            last_err = e
+            root = None
+
+    item_elems = []
+    if root is not None:
+        item_elems = list(_iter_items(root))
+    else:
+        blocks = re.findall(r"<\s*ITEM\b.*?<\s*/\s*ITEM\s*>", txt, flags=re.IGNORECASE | re.DOTALL)
+        if not blocks:
+            raise ValueError(f"search.xml is not parseable as XML and contains no <ITEM> blocks: {last_err}") from last_err
+        for b in blocks:
+            try:
+                item_elems.append(ET.fromstring(b))
+            except ET.ParseError as e:
+                raise ValueError(f"Failed to parse ITEM block: {e}") from e
+
+    out: List[_RawItem] = []
+    for el in item_elems:
+        parsed = _parse_item_el(el)
+        if parsed is not None:
+            out.append(parsed)
 
     return out
 
