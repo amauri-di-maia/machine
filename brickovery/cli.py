@@ -694,41 +694,210 @@ def _compute_current_stats(offers: List[Dict[str, Any]]) -> Tuple[int, int, Opti
 
 
 def _parse_sold6m(html: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Parse BrickLink Price Guide Summary "Past/Last 6 Months Sales" section.
+
+    Returns:
+      {"new": {"qty": int|None, "avg": Decimal|None},
+       "used": {"qty": int|None, "avg": Decimal|None}}
+
+    Notes:
+      - This parser is intentionally heuristic and resilient to minor HTML/layout changes.
+      - It expects the user session to have currency set to EUR; if not, parsing still occurs
+        but the numeric value is returned as-is (caller may decide to accept/NULL it).
+    """
     try:
         from bs4 import BeautifulSoup  # type: ignore
     except Exception as e:
         raise RuntimeError("beautifulsoup4 is required for scraping. Add 'beautifulsoup4' to requirements.txt") from e
 
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    lines = [" ".join(l.split()) for l in text.splitlines() if l.strip()]
+    soup = BeautifulSoup(html or "", "html.parser")
+    out: Dict[str, Dict[str, Any]] = {"new": {"qty": None, "avg": None}, "used": {"qty": None, "avg": None}}
 
-    in_sold = False
-    out = {"new": {"qty": None, "avg": None}, "used": {"qty": None, "avg": None}}
+    def norm(s: str) -> str:
+        return " ".join((s or "").strip().split()).lower()
 
-    for line in lines:
-        if "Past 6 Months Sales" in line:
-            in_sold = True
-            continue
-        if in_sold and "Current Items for Sale" in line:
+    def parse_int(s: str) -> Optional[int]:
+        s = (s or "").strip()
+        m = re.search(r"\d[\d,\.]*", s)
+        if not m:
+            return None
+        v = m.group(0)
+        # thousands separators
+        if v.count(",") > 0 and v.count(".") > 0:
+            # assume ',' thousands
+            v = v.replace(",", "")
+        else:
+            # if only commas, treat as thousands if looks like 1,234; else decimal comma unlikely for qty
+            v = v.replace(",", "")
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+    def parse_decimal(s: str) -> Optional[Decimal]:
+        s = (s or "").strip()
+        # Strip currency symbols/words but keep digits + separators
+        m = re.search(r"\d[\d,\.]*", s)
+        if not m:
+            return None
+        v = m.group(0)
+        # Normalize separators:
+        # - "1,234.56" -> "1234.56"
+        # - "1.234,56" -> "1234.56"
+        if "," in v and "." in v:
+            if v.rfind(",") > v.rfind("."):
+                v = v.replace(".", "").replace(",", ".")
+            else:
+                v = v.replace(",", "")
+        elif "," in v and "." not in v:
+            # could be decimal comma or thousands; decide by trailing 2 digits
+            if re.search(r",\d{2}$", v):
+                v = v.replace(",", ".")
+            else:
+                v = v.replace(",", "")
+        try:
+            return Decimal(v)
+        except Exception:
+            return None
+
+    # Locate anchor text for the sold section
+    sold_anchor = None
+    for node in soup.find_all(string=True):
+        t = (node or "").strip()
+        if re.search(r"(past|last)\s+6\s+months\s+sales", t, flags=re.IGNORECASE):
+            sold_anchor = node
             break
 
-        m = re.match(r"^(New|Used):\s*(.+)$", line, flags=re.IGNORECASE)
-        if not (in_sold and m):
-            continue
-        kind = "new" if m.group(1).lower() == "new" else "used"
-        payload = m.group(2)
+    # If we can't find the section at all, fallback to very rough text scan.
+    if sold_anchor is None:
+        text = soup.get_text("\n")
+        lines = [" ".join(l.split()) for l in text.splitlines() if l.strip()]
+        in_sold = False
+        for line in lines:
+            if re.search(r"(past|last)\s+6\s+months\s+sales", line, flags=re.IGNORECASE):
+                in_sold = True
+                continue
+            if in_sold and re.search(r"current\s+items\s+for\s+sale", line, flags=re.IGNORECASE):
+                break
+            # Sometimes appears like "New  123  EUR 0.05" etc.
+            if in_sold and re.search(r"^(new|used)\b", line, flags=re.IGNORECASE):
+                kind = "new" if line.lower().startswith("new") else "used"
+                nums = re.findall(r"\d[\d,\.]*", line)
+                if nums:
+                    # Heuristic: first integer-like is qty, one of later is avg
+                    qty = parse_int(nums[0])
+                    avg = parse_decimal(nums[-1]) if len(nums) > 1 else None
+                    if qty is not None:
+                        out[kind]["qty"] = qty
+                    if avg is not None:
+                        out[kind]["avg"] = avg
+        return out
 
-        nums = re.findall(r"\d[\d,]*(?:\.\d+)?", payload)
-        if len(nums) >= 4:
-            qty = int(nums[1].replace(",", ""))
-            avg = nums[3]
-            if "," in avg and "." in avg:
-                avg = avg.replace(",", "")
-            elif "," in avg and "." not in avg:
-                avg = avg.replace(",", ".")
-            out[kind] = {"qty": qty, "avg": Decimal(avg)}
+    # Try to find the most relevant table near the sold section.
+    # Strategy: from anchor node, walk up to a container and search for the first table that has
+    # headers like "Avg Price"/"Average Price" and "Qty".
+    container = sold_anchor.parent
+    for _ in range(6):
+        if container is None:
+            break
+        if getattr(container, "name", None) in ("table", "div", "section", "td"):
+            break
+        container = container.parent
+
+    tables = []
+    if container is not None:
+        tables = container.find_all("table")
+    if not tables:
+        tables = soup.find_all("table")
+
+    best = None
+    best_score = -1
+    for tbl in tables:
+        hdrs = [norm(th.get_text(" ")) for th in tbl.find_all(["th"])]
+        score = 0
+        if any("avg" in h and "price" in h for h in hdrs) or any("average" in h and "price" in h for h in hdrs):
+            score += 2
+        if any("qty" in h for h in hdrs) or any("quantity" in h for h in hdrs):
+            score += 2
+        if any("new" in norm(tbl.get_text(" ")) for _ in [0]) and any("used" in norm(tbl.get_text(" ")) for _ in [0]):
+            score += 1
+        if score > best_score:
+            best_score = score
+            best = tbl
+
+    if best is None:
+        return out
+
+    # Build header index mapping (best effort)
+    header_cells = best.find_all("th")
+    headers = [norm(th.get_text(" ")) for th in header_cells]
+    idx_qty = None
+    idx_avg = None
+
+    # Try row-wise headers if present
+    # Many BL tables have headers in first row; if so, use that.
+    first_tr = best.find("tr")
+    if first_tr:
+        ths = first_tr.find_all(["th", "td"])
+        # if first row looks like headers (contains avg/qty words)
+        maybe_headers = [norm(x.get_text(" ")) for x in ths]
+        if any("avg" in h and "price" in h for h in maybe_headers) or any("qty" in h for h in maybe_headers):
+            headers = maybe_headers
+
+    for i, h in enumerate(headers):
+        if idx_qty is None and (("total qty" in h) or ("qty sold" in h) or ("quantity sold" in h) or (h == "qty") or ("qty" in h and "avg" not in h)):
+            idx_qty = i
+        if idx_avg is None and (("avg price" in h) or ("average price" in h) or ("avg" in h and "price" in h)):
+            idx_avg = i
+
+    # Fallback indices if header map not found (common pattern: Type | Total Qty | Total Sales | Avg Price | Min | Max)
+    # In that pattern: qty=1, avg=3
+    if idx_qty is None:
+        idx_qty = 1
+    if idx_avg is None:
+        idx_avg = 3
+
+    # Parse rows
+    for tr in best.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if len(tds) < 2:
+            continue
+        first = norm(tds[0].get_text(" "))
+        kind = None
+        if first.startswith("new"):
+            kind = "new"
+        elif first.startswith("used"):
+            kind = "used"
+        else:
+            continue
+
+        qty = None
+        avg = None
+        if idx_qty < len(tds):
+            qty = parse_int(tds[idx_qty].get_text(" "))
+        if idx_avg < len(tds):
+            avg = parse_decimal(tds[idx_avg].get_text(" "))
+
+        # If still missing, attempt heuristic from all numeric cells in row
+        if qty is None or avg is None:
+            nums = [c.get_text(" ") for c in tds[1:]]
+            parsed_nums = [parse_decimal(x) for x in nums if parse_decimal(x) is not None]
+            parsed_ints = [parse_int(x) for x in nums if parse_int(x) is not None]
+            if qty is None and parsed_ints:
+                qty = parsed_ints[0]
+            if avg is None and parsed_nums:
+                # Heuristic: pick a "small-ish" value that looks like avg (often not max/min)
+                # Prefer the second numeric if there are >=2, else last.
+                avg = parsed_nums[1] if len(parsed_nums) >= 2 else parsed_nums[-1]
+
+        if qty is not None:
+            out[kind]["qty"] = qty
+        if avg is not None:
+            out[kind]["avg"] = avg
+
     return out
+
 
 
 def _fetch(session, url: str, params: Dict[str, Any], headers: Dict[str, str], timeout_s: int, max_tries: int, delay_s: float) -> str:
@@ -830,54 +999,17 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
         skipped = 0
         errors = 0
 
-        now_dt = datetime.now(timezone.utc)
-        item_reports: List[Dict[str, Any]] = []
-
-        def _age_minutes(ts: Optional[str]) -> Optional[int]:
-            if not ts:
-                return None
-            try:
-                dt = _parse_iso(ts)
-                return int((now_dt - dt).total_seconds() // 60)
-            except Exception:
-                return None
-
         for it in items:
             itype = it["bl_itemtype"]
             pid = it["bl_part_id"]
             cid = it.get("bl_color_id")
-
             if cid is None:
                 skipped += 1
-                item_reports.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": None,
-                    "action": "skipped",
-                    "reason": "missing_color_id",
-                    "force": bool(args.force),
-                })
                 continue
-
             cid = int(cid)
-            last_ts_n = _last_ts(itype, pid, cid, "N")
-            last_ts_u = _last_ts(itype, pid, cid, "U")
 
-            if not args.force and _fresh(last_ts_n) and _fresh(last_ts_u):
+            if not args.force and _fresh(_last_ts(itype, pid, cid, "N")) and _fresh(_last_ts(itype, pid, cid, "U")):
                 skipped += 1
-                item_reports.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": cid,
-                    "action": "skipped",
-                    "reason": "fresh_by_ttl",
-                    "force": bool(args.force),
-                    "last_fetched_ts_n": last_ts_n,
-                    "last_fetched_ts_u": last_ts_u,
-                    "age_minutes_n": _age_minutes(last_ts_n),
-                    "age_minutes_u": _age_minutes(last_ts_u),
-                    "ttl_hours": ttl_hours,
-                })
                 continue
 
             try:
@@ -954,46 +1086,9 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 upsert("N", "new", lots_n, qty_n, minp_n, minp_est_n, offers_n)
                 upsert("U", "used", lots_u, qty_u, minp_u, minp_est_u, offers_u)
 
-                item_reports.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": cid,
-                    "action": "refreshed",
-                    "reason": None,
-                    "force": bool(args.force),
-                    "id_item": id_item,
-                    "fetched_ts": fetched_ts,
-                    "sold_6m_new_qty": sold.get("new", {}).get("qty"),
-                    "sold_6m_new_avg_eur": str(sold.get("new", {}).get("avg")) if sold.get("new", {}).get("avg") is not None else None,
-                    "sold_6m_used_qty": sold.get("used", {}).get("qty"),
-                    "sold_6m_used_avg_eur": str(sold.get("used", {}).get("avg")) if sold.get("used", {}).get("avg") is not None else None,
-                    "current_new_total_lots": lots_n,
-                    "current_new_total_qty": qty_n,
-                    "current_new_min_price_eur": str(minp_n) if minp_n is not None else None,
-                    "current_new_min_price_is_estimate": bool(minp_est_n) if minp_est_n is not None else None,
-                    "current_used_total_lots": lots_u,
-                    "current_used_total_qty": qty_u,
-                    "current_used_min_price_eur": str(minp_u) if minp_u is not None else None,
-                    "current_used_min_price_is_estimate": bool(minp_est_u) if minp_est_u is not None else None,
-                })
-
                 refreshed += 1
             except Exception as e:
                 errors += 1
-                item_reports.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": cid,
-                    "action": "error",
-                    "reason": "exception",
-                    "force": bool(args.force),
-                    "error": str(e),
-                    "last_fetched_ts_n": last_ts_n,
-                    "last_fetched_ts_u": last_ts_u,
-                    "age_minutes_n": _age_minutes(last_ts_n),
-                    "age_minutes_u": _age_minutes(last_ts_u),
-                    "ttl_hours": ttl_hours,
-                })
                 logger.log("m2.error", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, error=str(e))
 
         con.commit()
@@ -1014,11 +1109,9 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "cookie_env_var": args.cookie_env_var,
             "parser_version": parser_version,
             "data_source": data_source,
-            "items": item_reports,
         }
         _write_json(str(out_dir / f"refresh_report.{run_id}.json"), report)
-        # Não logar "items" inteiro (pode ser grande). Logar apenas resumo.
-        logger.log("m2.done", **{k: v for k, v in report.items() if k != "items"}, items_count=len(item_reports))
+        logger.log("m2.done", **report)
 
         return 0
     finally:
