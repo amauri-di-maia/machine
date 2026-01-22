@@ -112,12 +112,12 @@ jobs:
               "User-Agent": "Mozilla/5.0",
               "Accept": "text/html, */*; q=0.01",
               "X-Requested-With": "XMLHttpRequest",
-              "Referer": "https://www.bricklink.com/",
+              "Referer": "https://www.bricklink.com/v2/main.page",
               "Cookie": cookie,
           }
 
           tests = [
-              ("home", "https://www.bricklink.com/"),
+              ("home", "https://www.bricklink.com/v2/main.page"),
               ("catalogitem.page P=3005", "https://www.bricklink.com/v2/catalog/catalogitem.page?P=3005"),
           ]
 
