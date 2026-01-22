@@ -145,9 +145,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         con = connect(cfg.paths.sqlite_db)
         migrate(con)
         logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
-
         # Ingest upstream mapping (mirror + overrides tables, upstream_state)
-        # FIX: ingest_upstream_mapping expects explicit upstream args (checkout path, relpath, repo, ref, schema_hint)
         raw_hint = getattr(getattr(cfg, "upstream", None), "schema_hint", None)
         if raw_hint is None:
             schema_hint = {}
@@ -164,7 +162,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
                 schema_hint = {}
 
         upstream_checkout_path = (
-            os.getenv("UPSTREAM_CHECKOUT_PATH")
+            getattr(args, "upstream_checkout_path", None)
             or getattr(getattr(cfg, "upstream", None), "checkout_path", None)
             or "upstream/amauri-repo"
         )
