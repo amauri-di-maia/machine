@@ -53,36 +53,92 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y sqlite3
-          
+
       - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
         working-directory: repo
         env:
           UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
           UPSTREAM_REPO: amauri-di-maia/amauri-repo
           UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: |
           set -euo pipefail
           rm -rf upstream/amauri-repo || true
           mkdir -p upstream
 
-          # Full clone for reliability (commit SHA refs work reliably)
-          git clone "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" upstream/amauri-repo
+          git clone --depth 1 "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" upstream/amauri-repo
           cd upstream/amauri-repo
 
-          if [ -n "${UPSTREAM_REF:-}" ] && [ "${UPSTREAM_REF}" != "main" ]; then
-            git checkout -q "${UPSTREAM_REF}" || (git fetch --all --tags && git checkout -q "${UPSTREAM_REF}")
+          # Checkout the requested ref (default: main). Supports branch/tag/commit SHA.
+          if [ -n "${UPSTREAM_REF:-}" ]; then
+            git fetch --depth 1 origin "${UPSTREAM_REF}" || true
+            git checkout -q "${UPSTREAM_REF}" || true
           fi
 
-          test -f "data base/brickovery.db"
-          echo "OK: upstream DB present"
-          file "data base/brickovery.db" || true
+          UP_SHA="$(git rev-parse HEAD)"
+          echo "UPSTREAM_COMMIT_SHA=${UP_SHA}" >> "${GITHUB_ENV}"
+          echo "UPSTREAM_REF_USED=${UPSTREAM_REF:-}" >> "${GITHUB_ENV}"
+
+          DB_PATH="data base/brickovery.db"
+          test -f "${DB_PATH}"
+          ls -la "${DB_PATH}"
+
+          # Validate that the upstream file is a real SQLite DB (not LFS pointer / HTML / corrupt)
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("data base/brickovery.db")
+          head = p.read_bytes()[:64]
+          if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
+              raise SystemExit("ERROR: upstream brickovery.db is a Git LFS pointer. Re-upload it as a normal file (no LFS) on the upstream ref/branch.")
+          if not head.startswith(b"SQLite format 3 "):
+              sample = head.decode("utf-8", errors="replace").replace("
+"," ").replace("
+"," ")
+              raise SystemExit(f"ERROR: upstream brickovery.db is not SQLite. head_sample={sample!r}")
+          print("OK: upstream DB header is SQLite.")
+          PY
+
+          DB_SHA="$(python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          p = Path("data base/brickovery.db")
+          h = hashlib.sha256()
+          with p.open("rb") as f:
+              for chunk in iter(lambda: f.read(1024*1024), b""):
+                  h.update(chunk)
+          print(h.hexdigest())
+          PY
+          )"
+          echo "UPSTREAM_DB_SHA256=${DB_SHA}" >> "${GITHUB_ENV}"
+          echo "upstream_commit_sha=${UP_SHA}"
+          echo "upstream_db_sha256=${DB_SHA}"
+
+      - name: Build runtime config (pin upstream ref for this run)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          src = Path("configs/config.v1.yaml")
+          cfg = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
+          up = cfg.get("upstream") or {}
+          # Always use the same ref the workflow checked out (default: main)
+          up["ref"] = "${{ inputs.upstream_ref }}"
+          cfg["upstream"] = up
+
+          out = Path("configs/config.runtime.yaml")
+          out.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+          print("Wrote", out)
+          PY
 
       - name: Run M0 bootstrap
         working-directory: repo
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          python -m brickovery.cli bootstrap --config configs/config.v1.yaml
+          python -m brickovery.cli bootstrap --config configs/config.runtime.yaml
 
       - name: Upload artifacts (always)
         if: always()
