@@ -1,0 +1,119 @@
+name: Brickovery - M2 Refresh Market Cache
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: brickovery-m2-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  m2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone repo manually
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone upstream repo (read-only)
+        working-directory: repo
+        env:
+          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set RUN_ID
+        id: runid
+        run: echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
+
+      - name: M0 bootstrap
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m brickovery.cli bootstrap \
+            --config configs/config.v1.yaml \
+            --run-id "${RUN_ID}" \
+            --slice-id "0" \
+            --upstream-checkout-path upstream/amauri-repo \
+            --no-push \
+            --no-commit
+
+      - name: M1 normalize-input
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          test -f inputs/search.xml
+          python -m brickovery.cli normalize-input \
+            --config configs/config.v1.yaml \
+            --run-id "${RUN_ID}" \
+            --slice-id "0" \
+            --input inputs/search.xml \
+            --output-dir outputs/inputs
+
+      - name: M2 refresh-cache (TTL 6h, strict EU+ships-to-PT)
+        working-directory: repo
+        env:
+          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
+        run: |
+          set -euo pipefail
+          python -m brickovery.cli refresh-cache \
+            --config configs/config.v1.yaml \
+            --run-id "${RUN_ID}" \
+            --slice-id "0" \
+            --snapshot-id "${RUN_ID}" \
+            --ttl-hours "6" \
+            --cookie-env-var "BRICKLINK_COOKIE" \
+            --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
+
+      - name: Commit and push (atomic)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "brickovery: M2 refresh-cache (run_id=${RUN_ID})"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m2
+          path: |
+            repo/outputs/inputs
+            repo/outputs/market
+            repo/data base/logs
+            repo/data base/manifests
+            repo/data base/brickovery.db
+          if-no-files-found: warn
