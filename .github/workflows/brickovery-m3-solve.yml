@@ -1,0 +1,117 @@
+name: Brickovery - M3 Solve Seeds
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_id:
+        description: "Optional snapshot_id to solve against (defaults to latest in DB)"
+        required: false
+        type: string
+      normalized_items:
+        description: "Optional path to normalized_items.*.json (defaults to latest in outputs/inputs)"
+        required: false
+        type: string
+
+concurrency:
+  group: brickovery-m3-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone repo manually
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # fallback (keep minimal)
+            pip install PyYAML pydantic beautifulsoup4 typing-extensions
+          fi
+
+      - name: Install sqlite3
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Verify inputs exist
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la outputs/inputs || true
+          test -f configs/config.v1.yaml
+          # normalized items may be provided via workflow inputs; otherwise CLI will pick latest
+          if [ -n "${{ inputs.normalized_items }}" ]; then
+            test -f "${{ inputs.normalized_items }}"
+          fi
+
+      - name: M3 solve seeds
+        working-directory: repo
+        env:
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+          NORMALIZED_ITEMS: ${{ inputs.normalized_items }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          ARGS=()
+          if [ -n "${SNAPSHOT_ID}" ]; then
+            ARGS+=(--snapshot-id "${SNAPSHOT_ID}")
+          fi
+          if [ -n "${NORMALIZED_ITEMS}" ]; then
+            ARGS+=(--normalized-items "${NORMALIZED_ITEMS}")
+          fi
+          python -m brickovery.cli solve --config configs/config.v1.yaml --output-dir outputs/solver "${ARGS[@]}"
+
+      - name: Show latest solver output
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la outputs/solver || true
+          latest=$(ls -1 outputs/solver/seed_solutions.*.json 2>/dev/null | sort | tail -n 1 || true)
+          if [ -n "${latest}" ]; then
+            echo "latest: ${latest}"
+            python - <<'PY'
+            import json, sys, glob
+            p = sorted(glob.glob("outputs/solver/seed_solutions.*.json"))[-1]
+            data = json.load(open(p,"r",encoding="utf-8"))
+            print("run_id:", data.get("run_id"))
+            print("snapshot_id:", data.get("snapshot_id"))
+            print("scenarios:", len(data.get("scenarios",[])))
+            for s in data.get("scenarios",[]):
+              print("-", s.get("scenario"), "score:", s.get("costs",{}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items",[])))
+            PY
+          fi
+
+      - name: Upload solver artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m3-solver
+          path: |
+            repo/outputs/solver
+            repo/data base/logs
