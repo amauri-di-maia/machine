@@ -60,7 +60,7 @@ jobs:
           export PYTHONPATH="$PWD"
           RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
           echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
-          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml --force
+          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml
 
       - name: Check refresh_report result
         if: always()
