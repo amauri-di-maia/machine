@@ -38,19 +38,32 @@ def _cfg_to_dict(cfg: Any) -> Dict[str, Any]:
 
 
 def _build_dataclass_instance(cls: Any, data: Dict[str, Any]) -> Any:
-    """Constrói um dataclass (RunManifest) de forma compatível mesmo se o schema variar."""
+    """Constrói um dataclass (RunManifest) de forma compatível mesmo se o schema variar.
+    Falha de forma explícita se faltar um campo obrigatório sem default.
+    """
     allowed = {f.name for f in fields(cls)}
     out: Dict[str, Any] = {}
     for k, v in data.items():
         if k in allowed:
             out[k] = v
-    # preencher defaults obrigatórios (se existirem)
+
+    missing_required: List[str] = []
     for f in fields(cls):
-        if f.name not in out:
-            if f.default is not MISSING:
-                out[f.name] = f.default
-            elif f.default_factory is not MISSING:  # type: ignore
-                out[f.name] = f.default_factory()  # type: ignore
+        if f.name in out:
+            continue
+        if f.default is not MISSING:
+            out[f.name] = f.default
+            continue
+        if getattr(f, "default_factory", MISSING) is not MISSING:  # type: ignore[attr-defined]
+            out[f.name] = f.default_factory()  # type: ignore[misc]
+            continue
+        missing_required.append(f.name)
+
+    if missing_required:
+        raise RuntimeError(
+            f"RunManifest missing required fields: {missing_required}. " 
+            f"Provide them in manifest_data or add defaults to RunManifest."
+        )
     return cls(**out)
 
 
@@ -292,150 +305,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
         # Run manifest
         cfg_hash = sha256_json(_cfg_to_dict(cfg))
-        manifest_data = {
-            "run_id": run_id,
-            "slice_id": slice_id,
-            "created_ts": utc_now_iso(),
-            "config_hash": cfg_hash,
-            "notes": "M0 bootstrap",
-        }
-        manifest = _build_dataclass_instance(RunManifest, manifest_data)
-        write_manifest(cfg.paths.manifests_dir, manifest)
-
-        # Commit/push opcional
-        if getattr(cfg.github_sync, "enabled", False) and not args.no_commit:
-            msg = f"brickovery: M0 bootstrap (run_id={run_id} slice_id={slice_id})"
-            do_push = (not args.no_push) and getattr(cfg.github_sync, "push", False)
-            sync_res = sync_repo(
-                repo_root=cfg.paths.repo_root,
-                do_pull=False,
-                do_commit=True,
-                do_push=do_push,
-                commit_message=msg,
-                user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
-                user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
-                fail_safe_on_push_conflict=getattr(cfg.github_sync, "fail_safe_on_push_conflict", True),
-            )
-            logger.log("git.sync.done", status=sync_res.status, did_commit=sync_res.did_commit, did_push=sync_res.did_push)
-
-        logger.log("bootstrap.done")
-        return 0
-
-    finally:
-        lock.release()
-
-
-# ============================================================================
-# M1: normalize-input
-# ============================================================================
-
-def cmd_normalize_input(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-
-    run_id = args.run_id or make_run_id()
-    slice_id = args.slice_id
-
-    lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds)
-    logger = JsonlLogger(cfg.paths.logs_dir, run_id=run_id, slice_id=slice_id)
-
-    lock.acquire(owner_run_id=run_id, owner_info={"action": "normalize-input"}, wait_seconds=args.lock_wait_seconds)
-    try:
-        logger.log("normalize.start", input_path=args.input)
-
-        con = connect(cfg.paths.sqlite_db)
-        migrate(con)
-
-        raw = _parse_search_xml(args.input)
-        items = _aggregate_items(raw)
-
-        stats = {
-            "raw_items": len(raw),
-            "requested_items": len(items),
-            "mapped_ok": 0,
-            "missing_boid": 0,
-            "weight_ok": 0,
-            "missing_weight": 0,
-            "overrides_created": 0,
-        }
-
-        normalized: List[Dict[str, Any]] = []
-        total_weight_mg = 0
-
-        for it in items:
-            boid = _lookup_override(con, it)
-            mapping_source = "override"
-            mapping_status = "OK" if boid else "MISS"
-
-            if not boid:
-                boid, wmg = _lookup_upstream(con, it)
-                mapping_source = "upstream"
-                mapping_status = "OK" if boid else "MISS"
-            else:
-                wmg = None
-
-            if mapping_status == "OK":
-                stats["mapped_ok"] += 1
-            else:
-                stats["missing_boid"] += 1
-                if _ensure_fill_later(con, it, reason="missing boid in upstream/override"):
-                    stats["overrides_created"] += 1
-
-            # weight (prefer upstream row weight; fallback by part-only)
-            weight_mg = wmg
-            if weight_mg is None:
-                weight_mg = _lookup_weight_fallback(con, it)
-
-            weight_status = "OK" if weight_mg is not None else "MISS"
-            if weight_status == "OK":
-                stats["weight_ok"] += 1
-                total_weight_mg += int(weight_mg) * int(it.qty)
-            else:
-                stats["missing_weight"] += 1
-
-            normalized.append(
-                {
-                    "bl_itemtype": it.bl_itemtype,
-                    "bl_part_id": it.bl_part_id,
-                    "bl_color_id": it.bl_color_id,
-                    "condition": it.condition,
-                    "qty": it.qty,
-                    "bo_boid": boid,
-                    "weight_mg": weight_mg,
-                    "mapping_source": mapping_source,
-                    "mapping_status": mapping_status,
-                    "weight_status": weight_status,
-                }
-            )
-
-        con.commit()
-        con.close()
-
-        out_dir = Path(args.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        normalized_path = out_dir / f"normalized_items.{run_id}.json"
-        normalized_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        # input manifest (mínimo, auditável)
-        input_manifest = {
-            "run_id": run_id,
-            "slice_id": slice_id,
-            "created_ts": utc_now_iso(),
-            "input_path": args.input,
-            "input_sha256": sha256_file(args.input),
-            "normalized_items_path": str(normalized_path),
-            "normalized_items_sha256": sha256_file(str(normalized_path)),
-            "normalized_items_hash": sha256_json(normalized),
-            "stats": stats,
-            "total_weight_mg": total_weight_mg,
-        }
-        input_manifest["manifest_hash"] = sha256_json(input_manifest)
-
-        input_manifest_path = out_dir / f"input_manifest.{run_id}.json"
-        input_manifest_path.write_text(json.dumps(input_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        # Run manifest
-        cfg_hash = sha256_json(_cfg_to_dict(cfg))
+        up_row = con.execute("SELECT upstream_commit_sha, upstream_db_sha256 FROM upstream_state WHERE id=1").fetchone()
+        up_commit = up_row[0] if up_row else ""
+        up_dbsha = up_row[1] if up_row else ""
         manifest_data = {
             "run_id": run_id,
             "slice_id": slice_id,
@@ -444,6 +316,11 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "notes": "M1 normalize-input",
             "input_path": args.input,
             "input_hash": input_manifest["input_sha256"],
+            "upstream_repo": getattr(cfg.upstream, "repo", ""),
+            "upstream_ref": getattr(cfg.upstream, "ref", ""),
+            "upstream_commit_sha": up_commit,
+            "upstream_db_relpath": getattr(cfg.upstream, "db_relpath", ""),
+            "upstream_db_sha256": up_dbsha,
         }
         manifest = _build_dataclass_instance(RunManifest, manifest_data)
         write_manifest(cfg.paths.manifests_dir, manifest)
