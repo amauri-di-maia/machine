@@ -84,6 +84,80 @@ jobs:
               sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
           PY
 
+
+      - name: DB gate (market tables sanity)
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3, sys
+          from pathlib import Path
+
+          DB = Path("data base/brickovery.db")
+          if not DB.exists():
+              raise SystemExit(f"DB gate FAILED: missing DB at {DB}")
+
+          head = DB.read_bytes()[:16]
+          if not head.startswith(b"SQLite format 3\x00"):
+              # show readable head to help diagnose LFS pointer / HTML etc.
+              sample = DB.read_bytes()[:64].decode("utf-8", errors="replace").replace("\n"," ")
+              raise SystemExit(f"DB gate FAILED: DB is not SQLite. head_sample={sample!r}")
+
+          con = sqlite3.connect(str(DB))
+          con.row_factory = sqlite3.Row
+
+          def has_table(name: str) -> bool:
+              row = con.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                  (name,),
+              ).fetchone()
+              return row is not None
+
+          required = ["market_metrics", "market_offers"]
+          missing = [t for t in required if not has_table(t)]
+          if missing:
+              print("DB gate FAILED: missing required tables:", ", ".join(missing))
+              sys.exit(1)
+
+          # Basic row counts
+          for t in required:
+              n = con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+              print(f"{t}.rows={n}")
+
+          # market_metrics sanity: must have BL rows for N/U (per spec)
+          n_bl_nu = con.execute(
+              "SELECT COUNT(*) AS n FROM market_metrics WHERE platform='BL' AND condition IN ('N','U')"
+          ).fetchone()["n"]
+          print(f"market_metrics.bl_nu_rows={n_bl_nu}")
+          if n_bl_nu == 0:
+              print("DB gate FAILED: market_metrics has no platform='BL' rows for condition N/U.")
+              sys.exit(1)
+
+          # BASE_VALUE availability indicator (not a hard failure)
+          n_base = con.execute(
+              "SELECT COUNT(*) AS n FROM market_metrics WHERE sold_6m_avg_price_eur IS NOT NULL"
+          ).fetchone()["n"]
+          print(f"market_metrics.base_value_nonnull={n_base}")
+
+          # market_offers sanity: must have ships_to_me=1 and EU store countries
+          EU = {
+              "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT",
+              "LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
+          }
+          placeholders = ",".join(["?"] * len(EU))
+          n_eu = con.execute(
+              f"SELECT COUNT(*) AS n FROM market_offers "
+              f"WHERE ships_to_me=1 AND country_iso2 IN ({placeholders})",
+              tuple(sorted(EU)),
+          ).fetchone()["n"]
+          print(f"market_offers.ships_to_me_eu_rows={n_eu}")
+          if n_eu == 0:
+              print("DB gate FAILED: market_offers has 0 rows with ships_to_me=1 and EU country_iso2.")
+              sys.exit(1)
+
+          PY
+
       - name: Show last m2.error events (jsonl)
         if: always()
         working-directory: repo
