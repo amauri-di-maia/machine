@@ -1,7 +1,12 @@
 name: Brickovery - Bootstrap (M0)
 
-on:
+'on':
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref (branch/tag/commit SHA) to ingest"
+        required: false
+        default: "main"
   push:
     branches: ["main"]
 
@@ -30,127 +35,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Git diagnostics (must be inside worktree)
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          pwd
-          git rev-parse --is-inside-work-tree
-          git status --porcelain
-          git remote -v
-
-      - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
-        env:
-          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd repo
-          rm -rf upstream/amauri-repo || true
-          mkdir -p upstream
-
-          # Read upstream settings from config (avoid hardcoding)
-          UPSTREAM_REPO="$(python - <<'PY'
-import re
-p='configs/config.v1.yaml'
-txt=open(p,'r',encoding='utf-8').read().splitlines()
-in_up=False
-indent=None
-repo=None
-ref=None
-db=None
-for line in txt:
-    if not in_up:
-        if re.match(r'^upstream\s*:\s*$', line.strip()):
-            in_up=True
-            continue
-    else:
-        # stop at next top-level key (non-indented)
-        if line and not line.startswith(' ') and not line.startswith('\t'):
-            break
-        m=re.match(r'^(\s*)([A-Za-z0-9_]+)\s*:\s*(.*)\s*$', line)
-        if not m:
-            continue
-        key=m.group(2)
-        val=m.group(3).strip().strip('"').strip("'")
-        if key=='repo':
-            repo=val
-        elif key=='ref':
-            ref=val
-        elif key in ('db_relpath','db_path','db'):
-            db=val
-print(repo or '')
-PY
-)"
-          UPSTREAM_REF="$(python - <<'PY'
-import re
-p='configs/config.v1.yaml'
-txt=open(p,'r',encoding='utf-8').read().splitlines()
-in_up=False
-ref=None
-for line in txt:
-    if not in_up:
-        if re.match(r'^upstream\s*:\s*$', line.strip()):
-            in_up=True
-            continue
-    else:
-        if line and not line.startswith(' ') and not line.startswith('\t'):
-            break
-        m=re.match(r'^\s*ref\s*:\s*(.*)\s*$', line)
-        if m:
-            ref=m.group(1).strip().strip('"').strip("'")
-            break
-print(ref or 'main')
-PY
-)"
-          UPSTREAM_DB_RELPATH="$(python - <<'PY'
-import re
-p='configs/config.v1.yaml'
-txt=open(p,'r',encoding='utf-8').read().splitlines()
-in_up=False
-db=None
-for line in txt:
-    if not in_up:
-        if re.match(r'^upstream\s*:\s*$', line.strip()):
-            in_up=True
-            continue
-    else:
-        if line and not line.startswith(' ') and not line.startswith('\t'):
-            break
-        m=re.match(r'^\s*db_relpath\s*:\s*(.*)\s*$', line)
-        if m:
-            db=m.group(1).strip().strip('"').strip("'")
-            break
-print(db or 'data base/brickovery.db')
-PY
-)"
-
-          echo "Upstream repo: ${UPSTREAM_REPO}"
-          echo "Upstream ref:  ${UPSTREAM_REF}"
-          echo "Upstream db:   ${UPSTREAM_DB_RELPATH}"
-
-          export GIT_LFS_SKIP_SMUDGE=1
-          git clone --depth 1 "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" "upstream/amauri-repo"
-          cd upstream/amauri-repo
-
-          if [[ "${UPSTREAM_REF}" =~ ^[0-9a-f]{7,40}$ ]]; then
-            git fetch --depth 1 origin "${UPSTREAM_REF}"
-            git checkout -q "${UPSTREAM_REF}"
-          else
-            git checkout -q "${UPSTREAM_REF}" || true
-          fi
-
-          test -f "${UPSTREAM_DB_RELPATH}"
-          echo "OK: upstream DB present" 
-
-
-      - name: Verify upstream schema (brickovery_db)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
-          sqlite3 "repo/upstream/amauri-repo/data base/brickovery.db" ".tables"
-          sqlite3 "repo/upstream/amauri-repo/data base/brickovery.db" "PRAGMA table_info('brickovery_db');"
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -161,152 +45,48 @@ PY
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Preflight - verify required table files exist
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          test -f "data/tables/shipping_normal.txt"
-          test -f "data/tables/shipping_registered.txt"
-          test -f "data/tables/rarity_rules.txt"
-          echo "OK: table files exist"
-          ls -la "data/tables"
-
-      - name: Run bootstrap (M0) - no internal git sync
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          python -m brickovery.cli bootstrap \
-            --config configs/config.v1.yaml \
-            --no-pull \
-            --no-commit \
-            --no-push
-
-      - name: Sanity check - fill rates in working DB
-        working-directory: repo
-        run: |
-          set -euo pipefail
+          # Keep deps minimal for M0
+          pip install -e .
+          # Ensure sqlite3 cli exists
           sudo apt-get update
           sudo apt-get install -y sqlite3
-          sqlite3 "data base/brickovery.db" "
-            SELECT
-              COUNT(*) AS total,
-              SUM(CASE WHEN bo_boid IS NOT NULL AND TRIM(CAST(bo_boid AS TEXT))!='' THEN 1 ELSE 0 END) AS nn_boid,
-              SUM(CASE WHEN weight_mg IS NOT NULL AND weight_mg>0 THEN 1 ELSE 0 END) AS nn_weight_mg
-            FROM up_mapping_mirror;
-          "
-          
-      - name: Build upstream schema report (creates upstream_schema_report.txt)
+
+      - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
         working-directory: repo
+        env:
+          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+          UPSTREAM_REPO: amauri-di-maia/amauri-repo
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import sqlite3, os
+          rm -rf upstream/amauri-repo || true
+          mkdir -p upstream
 
-          db_path = "upstream/amauri-repo/data base/brickovery.db"
-          con = sqlite3.connect(db_path)
-          con.row_factory = sqlite3.Row
+          # Full clone for reliability (commit SHA refs work reliably)
+          git clone "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" upstream/amauri-repo
+          cd upstream/amauri-repo
 
-          def tables():
-              return [r["name"] for r in con.execute(
-                  "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
-              )]
-
-          def cols(t):
-              return [r["name"] for r in con.execute(f"PRAGMA table_info('{t}');")]
-
-          def pick(columns, keys):
-              for c in columns:
-                  cl = c.lower()
-                  if any(k in cl for k in keys):
-                      return c
-              return None
-
-          def nn_count(t, col, limit=80000):
-              if not col:
-                  return 0
-              q = f"""
-                SELECT SUM(CASE WHEN {col} IS NOT NULL AND TRIM(CAST({col} AS TEXT))!='' THEN 1 ELSE 0 END) AS nn
-                FROM (SELECT {col} FROM '{t}' LIMIT {limit});
-              """
-              try:
-                  return int(con.execute(q).fetchone()["nn"] or 0)
-              except Exception:
-                  return 0
-
-          candidates = []
-          for t in tables():
-              c = cols(t)
-              low = [x.lower() for x in c]
-
-              # só considerar tabelas com indícios de BOID/BrickOwl ou Weight
-              if not any("boid" in x or "brickowl" in x for x in low) and not any("weight" in x or "gram" in x or "mass" in x for x in low):
-                  continue
-
-              boid_col = pick(c, ["boid"])
-              w_col    = pick(c, ["weight"])
-              bl_part  = pick(c, ["bl_part_id"])
-              bl_color = pick(c, ["bl_color_id"])
-              it_type  = pick(c, ["item_type"])
-
-              nn_boid = nn_count(t, boid_col)
-              nn_w    = nn_count(t, w_col)
-
-              score = 0
-              score += 10 if nn_boid > 0 else 0
-              score +=  5 if nn_w > 0 else 0
-              score +=  2 if bl_part else 0
-              score +=  1 if bl_color else 0
-              score +=  1 if it_type else 0
-
-              candidates.append((score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type))
-
-          candidates.sort(reverse=True)
-
-          out = []
-          out.append("UPSTREAM SCHEMA REPORT")
-          out.append(f"db_path: {db_path}")
-          out.append("")
-          out.append("TOP CANDIDATES (ordered by score, nn_boid(sample), nn_weight(sample))")
-          out.append("score | nn_boid | nn_weight | table | boid_col | weight_col | bl_part_col | bl_color_col | bl_itemtype_col")
-          out.append("-"*120)
-          for score, nn_boid, nn_w, t, boid_col, w_col, bl_part, bl_color, it_type in candidates[:25]:
-              out.append(f"{score:>5} | {nn_boid:>7} | {nn_w:>9} | {t} | {boid_col} | {w_col} | {bl_part} | {bl_color} | {it_type}")
-
-          os.makedirs("data base", exist_ok=True)
-          with open("data base/upstream_schema_report.txt", "w", encoding="utf-8") as f:
-              f.write("\n".join(out) + "\n")
-
-          con.close()
-          print("Wrote: data base/upstream_schema_report.txt")
-          PY
-
-      - name: Commit and push outputs (controlled)
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "brickovery: bootstrap (run_id=${{ github.run_id }})"
-            git push origin "HEAD:${{ github.ref_name }}"
-          else
-            echo "No changes to commit."
+          if [ -n "${UPSTREAM_REF:-}" ] && [ "${UPSTREAM_REF}" != "main" ]; then
+            git checkout -q "${UPSTREAM_REF}" || (git fetch --all --tags && git checkout -q "${UPSTREAM_REF}")
           fi
 
-      - name: Upload debug artifacts
+          test -f "data base/brickovery.db"
+          echo "OK: upstream DB present"
+          file "data base/brickovery.db" || true
+
+      - name: Run M0 bootstrap
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m brickovery.cli bootstrap --config configs/config.v1.yaml --no-push || true
+
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: brickovery-m0-debug
+          name: brickovery-m0
           path: |
-            repo/data base/logs
-            repo/data base/manifests
             repo/data base/brickovery.db
-            repo/data base/upstream_schema_report.txt
+            repo/data base/logs
+            repo/outputs
           if-no-files-found: warn
-          
