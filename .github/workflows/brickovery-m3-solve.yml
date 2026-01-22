@@ -96,16 +96,7 @@ jobs:
           latest=$(ls -1 outputs/solver/seed_solutions.*.json 2>/dev/null | sort | tail -n 1 || true)
           if [ -n "${latest}" ]; then
             echo "latest: ${latest}"
-            python - <<'PY'
-            import json, sys, glob
-            p = sorted(glob.glob("outputs/solver/seed_solutions.*.json"))[-1]
-            data = json.load(open(p,"r",encoding="utf-8"))
-            print("run_id:", data.get("run_id"))
-            print("snapshot_id:", data.get("snapshot_id"))
-            print("scenarios:", len(data.get("scenarios",[])))
-            for s in data.get("scenarios",[]):
-              print("-", s.get("scenario"), "score:", s.get("costs",{}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items",[])))
-            PY
+            python -c 'import json,glob; p=sorted(glob.glob("outputs/solver/seed_solutions.*.json"))[-1]; data=json.load(open(p,"r",encoding="utf-8")); print("run_id:",data.get("run_id")); print("snapshot_id:",data.get("snapshot_id")); sc=data.get("scenarios") or []; print("scenarios:",len(sc)); [print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or [])) for s in sc]'
           fi
 
       - name: Upload solver artifacts
