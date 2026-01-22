@@ -5,7 +5,6 @@ import json
 import os
 import re
 import time
-import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -59,37 +58,6 @@ def _hash_list(obj: Any) -> str:
     h = hashlib.sha256()
     h.update(s)
     return h.hexdigest()
-
-
-def _git_rev_parse_head(repo_path: str) -> str:
-    """Return HEAD commit sha for a git worktree; empty string if unavailable."""
-    try:
-        out = subprocess.check_output(
-            ["git", "-C", repo_path, "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        return out
-    except Exception:
-        return ""
-
-
-def _assert_sqlite_header(db_path: Path) -> None:
-    """Fail fast with a clear error if the upstream DB is not a real SQLite file."""
-    if not db_path.exists():
-        raise FileNotFoundError(f"Upstream DB not found at: {db_path}")
-    head = db_path.read_bytes()[:64]
-    if head.startswith(b"SQLite format 3\0"):
-        return
-    if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
-        raise RuntimeError(
-            "Upstream brickovery.db is a Git LFS pointer (not the real SQLite file). "
-            "Fix: ensure the upstream commit/branch stores brickovery.db as a normal file (no LFS), "
-            "or provide an upstream_ref that points to a non-LFS commit."
-        )
-    sample = head.decode("utf-8", errors="replace").replace("\n", " ").replace("\r", " ")
-    raise RuntimeError(f"Upstream brickovery.db is not a valid SQLite file. head_sample={sample!r}")
-
 
 
 def _get_upstream_state(con) -> Dict[str, str]:
@@ -199,15 +167,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             or "upstream/amauri-repo"
         )
 
-        # Validate upstream DB before opening with sqlite (avoid opaque "file is not a database")
-        db_path = Path(upstream_checkout_path) / cfg.upstream.db_relpath
-        _assert_sqlite_header(db_path)
-
-        # Best-effort capture of the exact upstream commit used (for auditability when ref='main')
-        upstream_commit_sha_env = os.getenv("UPSTREAM_COMMIT_SHA", "").strip()
-        upstream_commit_sha_git = _git_rev_parse_head(upstream_checkout_path)
-        upstream_commit_sha = upstream_commit_sha_env or upstream_commit_sha_git
-
         up_res = ingest_upstream_mapping(
             con_work=con,
             upstream_checkout_path=upstream_checkout_path,
@@ -216,9 +175,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             upstream_ref=cfg.upstream.ref,
             schema_hint=schema_hint,
         )
-        # If ingest did not provide commit sha, fill from env/git
-        if upstream_commit_sha and not up_res.get("upstream_commit_sha"):
-            up_res["upstream_commit_sha"] = upstream_commit_sha
         logger.log("upstream.ingested", **up_res)
 
         # Shipping
@@ -567,8 +523,27 @@ PRICE_RE = re.compile(r"(?P<tilde>~)?\s*(?P<cur>EUR)\s*(?P<num>\d[\d\.,]*)", re.
 BOX_RE = re.compile(r"box16([YN])\.png", re.IGNORECASE)
 FLAG_RE = re.compile(r"/flagsS/([A-Z]{2})\.(gif|png)", re.IGNORECASE)
 STORE_RE = re.compile(r"store\.asp\?", re.IGNORECASE)
-IDITEM_RE = re.compile(r"[?&]idItem=(\d+)", re.IGNORECASE)
-IDITEM_JSON_RE = re.compile(r'"idItem"\s*:\s*(\d+)', re.IGNORECASE)
+IDITEM_JSON_RE = re.compile(r'"idItem"\s*:\s*"?([0-9]+)"?', re.IGNORECASE)
+
+def _extract_id_item(html: str) -> Optional[int]:
+    """Best-effort extraction of BrickLink internal idItem from catalog HTML.
+    BrickLink varies markup; we try multiple patterns.
+    """
+    m = IDITEM_JSON_RE.search(html)
+    if m:
+        return int(m.group(1))
+    patterns = [
+        r"\bidItem\b\s*=\s*(\d+)",
+        r"\bidItem\b\s*:\s*(\d+)",
+        r"idItem=(\d+)",
+        r"data-iditem=[\"\'](\d+)[\"\']",
+        r"var\s+idItem\s*=\s*(\d+)",
+    ]
+    for pat in patterns:
+        mm = re.search(pat, html, flags=re.IGNORECASE)
+        if mm:
+            return int(mm.group(1))
+    return None
 
 
 def _ensure_market_schema(con) -> None:
@@ -771,7 +746,13 @@ def _fetch(session, url: str, params: Dict[str, Any], headers: Dict[str, str], t
         except Exception as e:
             last = e
             time.sleep(min(12.0, 2.0 ** attempt))
-    raise RuntimeError(f"Failed to fetch {url} after {max_tries} tries") from last
+    detail = ""
+    if last is not None:
+        resp = getattr(last, "response", None)
+        if resp is not None:
+            detail += f" status={getattr(resp, 'status_code', None)}"
+        detail += f" last_error={type(last).__name__}: {last}"
+    raise RuntimeError(f"Failed to fetch {url} after {max_tries} tries.{detail}") from last
 
 
 def cmd_refresh_cache(args: argparse.Namespace) -> int:
@@ -864,10 +845,10 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
 
             try:
                 html_cat = _fetch(session, url_catalog, params={itype.upper(): pid}, headers=headers, timeout_s=args.timeout_s, max_tries=args.max_tries, delay_s=0.0)
-                m = IDITEM_RE.search(html_cat) or IDITEM_JSON_RE.search(html_cat)
-                if not m:
-                    raise RuntimeError(f"Could not resolve idItem for {itype}:{pid}")
-                id_item = int(m.group(1))
+                id_item = _extract_id_item(html_cat)
+                if id_item is None:
+                    head = (html_cat or "")[:200].replace("\n", " ").replace("\r", " ")
+                    raise RuntimeError(f"Could not resolve idItem for {itype}:{pid} (html_head={head!r})")
 
                 html_sold = _fetch(
                     session,
