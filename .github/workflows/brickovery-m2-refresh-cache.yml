@@ -1,0 +1,208 @@
+name: Brickovery - M2 Refresh Cache
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: brickovery-m2-refresh-cache
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh_cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repo manually
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Verify input files exist
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la "inputs" || true
+          test -f "inputs/search.xml"
+          test -f "data base/rarity_rules.txt" || true
+          test -f "data base/shipping_normal.txt" || true
+          test -f "data base/shipping_registered.txt" || true
+
+      - name: Run M2 refresh-cache
+        working-directory: repo
+        env:
+          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
+          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml
+
+      - name: Check refresh_report result
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, glob, sys
+          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not paths:
+              print("ERROR: No outputs/market/refresh_report.*.json found")
+              sys.exit(1)
+          rp = paths[-1]
+          report = json.load(open(rp,"r",encoding="utf-8"))
+          errors = int(report.get("errors", 0))
+          refreshed = int(report.get("refreshed_items", 0))
+          skipped = int(report.get("skipped_items", 0))
+          print(f"refresh_report: {rp}")
+          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
+          if errors > 0:
+              sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
+          PY
+
+
+      - name: DB gate (market tables sanity)
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3, sys
+          from pathlib import Path
+
+          DB = Path("data base/brickovery.db")
+          if not DB.exists():
+              raise SystemExit(f"DB gate FAILED: missing DB at {DB}")
+
+          head = DB.read_bytes()[:16]
+          if not head.startswith(b"SQLite format 3\x00"):
+              # show readable head to help diagnose LFS pointer / HTML etc.
+              sample = DB.read_bytes()[:64].decode("utf-8", errors="replace").replace("\n"," ")
+              raise SystemExit(f"DB gate FAILED: DB is not SQLite. head_sample={sample!r}")
+
+          con = sqlite3.connect(str(DB))
+          con.row_factory = sqlite3.Row
+
+          def has_table(name: str) -> bool:
+              row = con.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                  (name,),
+              ).fetchone()
+              return row is not None
+
+          required = ["market_metrics", "market_offers"]
+          missing = [t for t in required if not has_table(t)]
+          if missing:
+              print("DB gate FAILED: missing required tables:", ", ".join(missing))
+              sys.exit(1)
+
+          # Basic row counts
+          for t in required:
+              n = con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+              print(f"{t}.rows={n}")
+
+          # market_metrics sanity: must have BL rows for N/U (per spec)
+          n_bl_nu = con.execute(
+              "SELECT COUNT(*) AS n FROM market_metrics WHERE platform='BL' AND condition IN ('N','U')"
+          ).fetchone()["n"]
+          print(f"market_metrics.bl_nu_rows={n_bl_nu}")
+          if n_bl_nu == 0:
+              print("DB gate FAILED: market_metrics has no platform='BL' rows for condition N/U.")
+              sys.exit(1)
+
+          # BASE_VALUE availability indicator (not a hard failure)
+          n_base = con.execute(
+              "SELECT COUNT(*) AS n FROM market_metrics WHERE sold_6m_avg_price_eur IS NOT NULL"
+          ).fetchone()["n"]
+          print(f"market_metrics.base_value_nonnull={n_base}")
+
+          # market_offers sanity: must have ships_to_me=1 and EU store countries
+          EU = {
+              "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT",
+              "LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
+          }
+          placeholders = ",".join(["?"] * len(EU))
+          n_eu = con.execute(
+              f"SELECT COUNT(*) AS n FROM market_offers "
+              f"WHERE ships_to_me=1 AND country_iso2 IN ({placeholders})",
+              tuple(sorted(EU)),
+          ).fetchone()["n"]
+          print(f"market_offers.ships_to_me_eu_rows={n_eu}")
+          if n_eu == 0:
+              print("DB gate FAILED: market_offers has 0 rows with ships_to_me=1 and EU country_iso2.")
+              sys.exit(1)
+
+          PY
+
+      - name: Show last m2.error events (jsonl)
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          # Prefer the RUN_ID we generated above (timestamp). If not present, fall back to newest run-* dir.
+          RID="${RUN_ID:-}"
+          LOG_ROOT="data base/logs"
+
+          if [ -n "$RID" ] && [ -d "${LOG_ROOT}/run-${RID}" ]; then
+            TARGET_DIR="${LOG_ROOT}/run-${RID}"
+          else
+            TARGET_DIR="$(ls -1d "${LOG_ROOT}"/run-* 2>/dev/null | sort | tail -n 1 || true)"
+          fi
+
+          echo "TARGET_LOG_DIR=${TARGET_DIR}"
+          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+            echo "No log dir found. Listing available logs:"
+            find "$LOG_ROOT" -maxdepth 3 -type f -name "slice-*.jsonl" -print || true
+            exit 0
+          fi
+
+          mapfile -d '' files < <(find "$TARGET_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No slice-*.jsonl found under: $TARGET_DIR"
+            find "$TARGET_DIR" -maxdepth 3 -type f -print || true
+            exit 0
+          fi
+
+          echo "== last m2.error events (if any) =="
+          for f in "${files[@]}"; do
+            echo "--- $f ---"
+            if grep -q '"event":"m2.error"' "$f"; then
+              grep '"event":"m2.error"' "$f" | tail -n 20
+            else
+              echo "(no m2.error entries; tail last 40 lines)"
+              tail -n 40 "$f" || true
+            fi
+          done
+
+      - name: Upload artifacts (outputs + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m2
+          path: |
+            repo/outputs/**
+            repo/data base/logs/**
