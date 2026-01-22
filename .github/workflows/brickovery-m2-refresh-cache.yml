@@ -74,7 +74,12 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json | head -n 1)"
+          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json 2>/dev/null | head -n 1 || true)"
+          if [ -z "$latest_norm" ]; then
+            echo "ERROR: normalize-input did not produce outputs/inputs/normalized_items.*.json"
+            ls -la outputs/inputs || true
+            exit 1
+          fi
           echo "path=$latest_norm" >> "$GITHUB_OUTPUT"
           echo "normalized_items_path=$latest_norm"
 
@@ -96,7 +101,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          NORM_PATH="$latest_norm" python - <<'PY'
+          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
           import json, glob, sys
           paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
           if not paths:
@@ -119,7 +124,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          NORM_PATH="$latest_norm" python - <<'PY'
+          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
           import sqlite3, sys
           from pathlib import Path
 
@@ -203,7 +208,7 @@ jobs:
           fi
           echo "normalized_items_for_debug=$latest_norm"
 
-          NORM_PATH="$latest_norm" python - <<'PY'
+          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
           import json, sqlite3
           from pathlib import Path
       
