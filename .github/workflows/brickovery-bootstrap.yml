@@ -49,7 +49,7 @@ jobs:
           mkdir -p upstream
           git clone "https://github.com/amauri-di-maia/amauri-repo/blob/12cf75d956779d4cc33539e9a2725490d9a955db/data%20base/brickovery.db"
           cd upstream/amauri-repo
-          git checkout 890761b4899290fe4724bda028f235ee34f6c9e5
+          git checkout 729a81bc66ed40d77807588a9fb15b912ef93e8710c2f676f28752f20fbf695e
 
 
       - name: Verify upstream schema (brickovery_db)
