@@ -1315,8 +1315,26 @@ def cmd_solve(args: argparse.Namespace) -> int:
             return offers
 
         def get_base_value(it: Dict[str, Any]) -> Optional[Decimal]:
-            row = con.execute(
-                '''
+            """Return the latest non-null BASE_VALUE (avg sold 6m) for this item+condition.
+
+            Market metrics may contain multiple rows over time; we must avoid accidentally
+            picking an older row where sold_6m_avg_price_eur is NULL.
+            """
+            # Discover a stable ordering column if present; otherwise fall back to rowid.
+            try:
+                cols = {r[1] for r in con.execute("PRAGMA table_info(market_metrics)").fetchall()}
+            except Exception:
+                cols = set()
+
+            order_col = None
+            for c in ("updated_ts", "ingested_ts", "fetched_ts", "created_ts", "snapshot_id"):
+                if c in cols:
+                    order_col = c
+                    break
+
+            order_sql = f"ORDER BY {order_col} DESC" if order_col else "ORDER BY rowid DESC"
+
+            sql = f'''
                 SELECT sold_6m_avg_price_eur
                 FROM market_metrics
                 WHERE platform='BL'
@@ -1324,12 +1342,23 @@ def cmd_solve(args: argparse.Namespace) -> int:
                   AND bl_part_id=?
                   AND ( (bl_color_id IS NULL AND ? IS NULL) OR bl_color_id=? )
                   AND condition=?
-                ''',
+                  AND sold_6m_avg_price_eur IS NOT NULL
+                {order_sql}
+                LIMIT 1
+            '''
+
+            row = con.execute(
+                sql,
                 (it["bl_itemtype"], it["bl_part_id"], it.get("bl_color_id"), it.get("bl_color_id"), it["condition"]),
             ).fetchone()
-            if not row or row[0] is None:
+
+            if not row:
                 return None
-            return _dec(str(row[0]))
+
+            try:
+                return _dec(str(row[0]))
+            except Exception:
+                return None
 
         # order items by operational rarity (fewest eligible stores)
         item_meta: List[Tuple[int, str, Dict[str, Any]]] = []
