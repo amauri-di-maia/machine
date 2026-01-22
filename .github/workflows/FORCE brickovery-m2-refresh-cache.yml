@@ -1,4 +1,4 @@
-name: Brickovery - M2 Refresh Cache
+name: FORCE Brickovery - M2 Refresh Cache
 
 on:
   workflow_dispatch:
