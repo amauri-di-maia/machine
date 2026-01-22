@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -58,6 +59,37 @@ def _hash_list(obj: Any) -> str:
     h = hashlib.sha256()
     h.update(s)
     return h.hexdigest()
+
+
+def _git_rev_parse_head(repo_path: str) -> str:
+    """Return HEAD commit sha for a git worktree; empty string if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out
+    except Exception:
+        return ""
+
+
+def _assert_sqlite_header(db_path: Path) -> None:
+    """Fail fast with a clear error if the upstream DB is not a real SQLite file."""
+    if not db_path.exists():
+        raise FileNotFoundError(f"Upstream DB not found at: {db_path}")
+    head = db_path.read_bytes()[:64]
+    if head.startswith(b"SQLite format 3\0"):
+        return
+    if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
+        raise RuntimeError(
+            "Upstream brickovery.db is a Git LFS pointer (not the real SQLite file). "
+            "Fix: ensure the upstream commit/branch stores brickovery.db as a normal file (no LFS), "
+            "or provide an upstream_ref that points to a non-LFS commit."
+        )
+    sample = head.decode("utf-8", errors="replace").replace("\n", " ").replace("\r", " ")
+    raise RuntimeError(f"Upstream brickovery.db is not a valid SQLite file. head_sample={sample!r}")
+
 
 
 def _get_upstream_state(con) -> Dict[str, str]:
@@ -167,6 +199,15 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             or "upstream/amauri-repo"
         )
 
+        # Validate upstream DB before opening with sqlite (avoid opaque "file is not a database")
+        db_path = Path(upstream_checkout_path) / cfg.upstream.db_relpath
+        _assert_sqlite_header(db_path)
+
+        # Best-effort capture of the exact upstream commit used (for auditability when ref='main')
+        upstream_commit_sha_env = os.getenv("UPSTREAM_COMMIT_SHA", "").strip()
+        upstream_commit_sha_git = _git_rev_parse_head(upstream_checkout_path)
+        upstream_commit_sha = upstream_commit_sha_env or upstream_commit_sha_git
+
         up_res = ingest_upstream_mapping(
             con_work=con,
             upstream_checkout_path=upstream_checkout_path,
@@ -175,6 +216,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             upstream_ref=cfg.upstream.ref,
             schema_hint=schema_hint,
         )
+        # If ingest did not provide commit sha, fill from env/git
+        if upstream_commit_sha and not up_res.get("upstream_commit_sha"):
+            up_res["upstream_commit_sha"] = upstream_commit_sha
         logger.log("upstream.ingested", **up_res)
 
         # Shipping
