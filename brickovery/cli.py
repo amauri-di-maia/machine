@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
 import time
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -1122,6 +1124,494 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
 # CLI wiring
 # =========================
 
+# =========================
+# M3: solve (greedy seed scenarios)
+# =========================
+
+def _latest_glob(paths: List[str]) -> Optional[str]:
+    cand: List[str] = []
+    for pat in paths:
+        cand.extend(glob.glob(pat))
+    if not cand:
+        return None
+    cand.sort()
+    return cand[-1]
+
+
+def _load_normalized_items(path: Optional[str]) -> Tuple[str, List[Dict[str, Any]]]:
+    if path:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"normalized-items not found: {path}")
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return str(p), data
+
+    latest = _latest_glob(["outputs/inputs/normalized_items.*.json"])
+    if not latest:
+        raise FileNotFoundError("No normalized_items.*.json found in outputs/inputs/. Run M1 first.")
+    p = Path(latest)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    return str(p), data
+
+
+def _dec(x: Optional[str]) -> Optional[Decimal]:
+    if x is None:
+        return None
+    try:
+        return Decimal(str(x))
+    except Exception:
+        try:
+            return Decimal(x.replace(",", "."))
+        except Exception:
+            return None
+
+
+def _shipping_bands(con, service_level: str, dest_country: str = "PT") -> List[Tuple[int, int, Decimal]]:
+    rows = con.execute(
+        "SELECT weight_min_mg, weight_max_mg, price_eur FROM shipping_band WHERE service_level=? AND dest_country=? ORDER BY weight_min_mg ASC;",
+        (service_level, dest_country),
+    ).fetchall()
+    out: List[Tuple[int, int, Decimal]] = []
+    for r in rows:
+        out.append((int(r[0]), int(r[1]), _dec(str(r[2])) or Decimal("0")))
+    return out
+
+
+def _shipping_cost_from_bands(bands: List[Tuple[int, int, Decimal]], weight_mg: int) -> Optional[Decimal]:
+    for mn, mx, price in bands:
+        if mn <= weight_mg <= mx:
+            return price
+    return None
+
+
+def _ensure_solver_tables(con) -> None:
+    con.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS solver_solutions(
+          run_id TEXT NOT NULL,
+          scenario TEXT NOT NULL,
+          created_ts TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL,
+          normalized_items_path TEXT NOT NULL,
+          total_score_eur TEXT,
+          total_parts_cost_eur TEXT,
+          total_shipping_cost_eur TEXT,
+          n_stores_used INTEGER,
+          missing_items INTEGER,
+          payload_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, scenario)
+        );
+        '''
+    )
+    con.commit()
+
+
+def _select_snapshot_id(con) -> str:
+    # Prefer latest snapshot present in market_metrics; fallback to market_offers.
+    row = con.execute("SELECT snapshot_id, MAX(fetched_ts) FROM market_metrics;").fetchone()
+    if row and row[0]:
+        return str(row[0])
+    row = con.execute("SELECT snapshot_id, MAX(fetched_ts) FROM market_offers;").fetchone()
+    if row and row[0]:
+        return str(row[0])
+    raise RuntimeError("No market data found. Run M2 refresh-cache first.")
+
+
+def cmd_solve(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    run_id = args.run_id or make_run_id()
+    slice_id = args.slice_id
+
+    logger = JsonlLogger(cfg.paths.logs_dir, run_id, slice_id)
+
+    lock = RepoLock(cfg.paths.lockfile, ttl_seconds=args.lock_ttl_seconds)
+    try:
+        lock.acquire(owner_run_id=run_id, owner_info={"slice_id": slice_id, "action": "solve"}, wait_seconds=args.lock_wait_seconds)
+    except RepoLockError as e:
+        raise SystemExit(str(e))
+
+    try:
+        # optional repo sync
+        if getattr(cfg.github_sync, "enabled", True) and not args.no_pull:
+            sync_repo(
+                repo_root=cfg.paths.repo_root,
+                pull=getattr(cfg.github_sync, "pull", True),
+                commit=False,
+                push=False,
+                git_user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
+                git_user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
+                logger=logger,
+            )
+
+        norm_path, items = _load_normalized_items(args.normalized_items)
+
+        con = connect(cfg.paths.sqlite_db)
+        migrate(con)
+        _ensure_market_schema(con)
+        _ensure_solver_tables(con)
+
+        snapshot_id = args.snapshot_id or _select_snapshot_id(con)
+
+        # load shipping bands (for both services)
+        bands_normal = _shipping_bands(con, "normal", "PT")
+        bands_reg = _shipping_bands(con, "registered", "PT")
+
+        if not bands_normal or not bands_reg:
+            raise RuntimeError("Shipping bands missing in DB. Run M0 bootstrap to ingest shipping tables.")
+
+        # scenario defaults
+        penalty_store_default = Decimal(str(getattr(cfg.raw.get("solver", {}), "penalty_store", 3))) if isinstance(cfg.raw, dict) else Decimal("3")
+        # robust defaults even if cfg.raw not populated
+        penalty_store_default = Decimal(str(getattr(args, "penalty_store", None) or 3))
+        base_excess_penalty_default = Decimal(str(getattr(args, "base_excess_penalty", None) or 1))
+
+        scenarios = [
+            {"name": "min_total_normal", "penalty_store": Decimal(str(args.penalty_store or 3)), "base_excess_penalty": Decimal(str(args.base_excess_penalty or 1)), "ship_service": "normal"},
+            {"name": "min_stores_normal", "penalty_store": Decimal(str(args.penalty_store_high or 10)), "base_excess_penalty": Decimal(str(args.base_excess_penalty or 1)), "ship_service": "normal"},
+            {"name": "base_strict_normal", "penalty_store": Decimal(str(args.penalty_store or 3)), "base_excess_penalty": Decimal(str(args.base_excess_penalty_strict or 5)), "ship_service": "normal"},
+            {"name": "min_total_registered", "penalty_store": Decimal(str(args.penalty_store or 3)), "base_excess_penalty": Decimal(str(args.base_excess_penalty or 1)), "ship_service": "registered"},
+            {"name": "min_stores_registered", "penalty_store": Decimal(str(args.penalty_store_high or 10)), "base_excess_penalty": Decimal(str(args.base_excess_penalty or 1)), "ship_service": "registered"},
+        ]
+
+        # Build offer pool for all items (across platforms if present)
+        # We treat each market_offers row as a "lot".
+        def fetch_offers_for_item(it: Dict[str, Any]) -> List[Dict[str, Any]]:
+            rows = con.execute(
+                '''
+                SELECT rowid, platform, store_url, country_iso2, ships_to_me, qty, price_eur, is_estimate, fetched_ts, data_source, parser_version
+                FROM market_offers
+                WHERE snapshot_id=?
+                  AND bl_itemtype=?
+                  AND bl_part_id=?
+                  AND ( (bl_color_id IS NULL AND ? IS NULL) OR bl_color_id=? )
+                  AND condition=?
+                  AND price_eur IS NOT NULL
+                ''',
+                (snapshot_id, it["bl_itemtype"], it["bl_part_id"], it.get("bl_color_id"), it.get("bl_color_id"), it["condition"]),
+            ).fetchall()
+
+            offers: List[Dict[str, Any]] = []
+            for r in rows:
+                platform = r[1]
+                country = (r[3] or "").upper()
+                ships = int(r[4] or 0)
+                if ships != 1:
+                    continue
+                if country and country not in EU_ISO2:
+                    continue
+                offers.append({
+                    "lot_id": int(r[0]),
+                    "platform": platform,
+                    "store_url": r[2] or "",
+                    "country_iso2": country,
+                    "ships_to_me": ships,
+                    "qty": int(r[5] or 0),
+                    "price_eur": str(r[6]),
+                    "is_estimate": int(r[7] or 0),
+                    "fetched_ts": r[8],
+                    "data_source": r[9],
+                    "parser_version": r[10],
+                })
+            return offers
+
+        def get_base_value(it: Dict[str, Any]) -> Optional[Decimal]:
+            row = con.execute(
+                '''
+                SELECT sold_6m_avg_price_eur
+                FROM market_metrics
+                WHERE platform='BL'
+                  AND bl_itemtype=?
+                  AND bl_part_id=?
+                  AND ( (bl_color_id IS NULL AND ? IS NULL) OR bl_color_id=? )
+                  AND condition=?
+                ''',
+                (it["bl_itemtype"], it["bl_part_id"], it.get("bl_color_id"), it.get("bl_color_id"), it["condition"]),
+            ).fetchone()
+            if not row or row[0] is None:
+                return None
+            return _dec(str(row[0]))
+
+        # order items by operational rarity (fewest eligible stores)
+        item_meta: List[Tuple[int, str, Dict[str, Any]]] = []
+        for it in items:
+            offers = fetch_offers_for_item(it)
+            store_count = len({f'{o["platform"]}|{o["store_url"]}' for o in offers})
+            key = f'{it["bl_itemtype"]}:{it["bl_part_id"]}:{it.get("bl_color_id")}:{it["condition"]}'
+            item_meta.append((store_count if store_count > 0 else 10**9, key, it))
+        item_meta.sort(key=lambda t: (t[0], t[1]))
+        ordered_items = [t[2] for t in item_meta]
+
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        created_ts = _iso_now()
+
+        all_results: Dict[str, Any] = {
+            "run_id": run_id,
+            "slice_id": slice_id,
+            "created_ts": created_ts,
+            "snapshot_id": snapshot_id,
+            "normalized_items_path": norm_path,
+            "scenarios": [],
+        }
+
+        def run_scenario(scn: Dict[str, Any]) -> Dict[str, Any]:
+            penalty_store = Decimal(str(scn["penalty_store"]))
+            base_excess_penalty = Decimal(str(scn["base_excess_penalty"]))
+            ship_service = scn["ship_service"]
+            bands_score = bands_normal if ship_service == "normal" else bands_reg
+
+            # store state
+            store_weight: Dict[str, int] = {}
+            store_used: Dict[str, bool] = {}
+            store_allocs: Dict[str, List[Dict[str, Any]]] = {}
+
+            totals = {
+                "parts_cost": Decimal("0"),
+                "base_excess_penalty": Decimal("0"),
+                "estimates_penalty": Decimal("0"),
+                "penalty_store_total": Decimal("0"),
+            }
+            missing: List[Dict[str, Any]] = []
+
+            # offer remaining per item
+            offers_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+            for it in ordered_items:
+                key = f'{it["bl_itemtype"]}|{it["bl_part_id"]}|{it.get("bl_color_id")}|{it["condition"]}'
+                if key not in offers_cache:
+                    offers_cache[key] = fetch_offers_for_item(it)
+                offers = offers_cache[key]
+
+                need = int(it["qty"])
+                if need <= 0:
+                    continue
+
+                base_value = get_base_value(it)
+                weight_mg = it.get("weight_mg")
+                weight_mg = int(weight_mg) if weight_mg is not None else None
+
+                # local remaining copy
+                rem = need
+                # track remaining quantities per offer
+                rem_qty = {o["lot_id"]: int(o["qty"]) for o in offers}
+
+                while rem > 0:
+                    best = None
+                    best_unit = None
+                    best_take = 0
+
+                    for o in offers:
+                        avail = rem_qty.get(o["lot_id"], 0)
+                        if avail <= 0:
+                            continue
+                        take = min(avail, rem)
+
+                        price = _dec(o["price_eur"])
+                        if price is None:
+                            continue
+
+                        excess = Decimal("0")
+                        if base_value is not None and price > base_value:
+                            excess = (price - base_value) * Decimal(take) * base_excess_penalty
+
+                        est_pen = Decimal("0")
+                        if int(o.get("is_estimate") or 0) == 1:
+                            # small deterministic penalty to prefer confirmed where equal
+                            est_pen = Decimal(take) * Decimal("0.01")
+
+                        store_key = f'{o["platform"]}|{o["store_url"]}'
+                        was_used = store_used.get(store_key, False)
+
+                        activation = Decimal("0")
+                        if not was_used:
+                            activation = penalty_store
+
+                        # shipping delta for scoring service
+                        old_w = store_weight.get(store_key, 0)
+                        add_w = (weight_mg or 0) * take
+                        new_w = old_w + add_w
+
+                        old_ship = _shipping_cost_from_bands(bands_score, old_w) if old_w > 0 else Decimal("0")
+                        new_ship = _shipping_cost_from_bands(bands_score, new_w) if new_w > 0 else Decimal("0")
+
+                        if old_ship is None or new_ship is None:
+                            ship_delta = Decimal("0")
+                        else:
+                            ship_delta = (new_ship - old_ship)
+
+                        parts = price * Decimal(take)
+                        total_marg = parts + excess + est_pen + activation + ship_delta
+                        unit = total_marg / Decimal(take)
+
+                        tiebreak = (unit, price, int(o.get("is_estimate") or 0), store_key, o["lot_id"])
+                        if best is None or tiebreak < best_unit:
+                            best = o
+                            best_unit = tiebreak
+                            best_take = take
+
+                    if best is None:
+                        break
+
+                    # commit allocation
+                    lot_id = best["lot_id"]
+                    take = best_take
+                    rem_qty[lot_id] -= take
+                    rem -= take
+
+                    price = _dec(best["price_eur"]) or Decimal("0")
+                    store_key = f'{best["platform"]}|{best["store_url"]}'
+                    if not store_used.get(store_key, False):
+                        store_used[store_key] = True
+                        totals["penalty_store_total"] += penalty_store
+
+                    old_w = store_weight.get(store_key, 0)
+                    add_w = (weight_mg or 0) * take
+                    store_weight[store_key] = old_w + add_w
+
+                    # cost accumulators
+                    totals["parts_cost"] += price * Decimal(take)
+                    if base_value is not None and price > base_value:
+                        totals["base_excess_penalty"] += (price - base_value) * Decimal(take) * base_excess_penalty
+                    if int(best.get("is_estimate") or 0) == 1:
+                        totals["estimates_penalty"] += Decimal(take) * Decimal("0.01")
+
+                    alloc = {
+                        "bl_itemtype": it["bl_itemtype"],
+                        "bl_part_id": it["bl_part_id"],
+                        "bl_color_id": it.get("bl_color_id"),
+                        "condition": it["condition"],
+                        "qty": take,
+                        "unit_price_eur": str(price),
+                        "base_value_eur": str(base_value) if base_value is not None else None,
+                        "platform": best["platform"],
+                        "store_url": best["store_url"],
+                        "lot_id": lot_id,
+                        "is_estimate": int(best.get("is_estimate") or 0),
+                        "country_iso2": best.get("country_iso2"),
+                        "ships_to_me": int(best.get("ships_to_me") or 0),
+                        "fetched_ts": best.get("fetched_ts"),
+                        "data_source": best.get("data_source"),
+                        "parser_version": best.get("parser_version"),
+                    }
+                    store_allocs.setdefault(store_key, []).append(alloc)
+
+                if rem > 0:
+                    missing.append({
+                        "bl_itemtype": it["bl_itemtype"],
+                        "bl_part_id": it["bl_part_id"],
+                        "bl_color_id": it.get("bl_color_id"),
+                        "condition": it["condition"],
+                        "qty_missing": rem,
+                        "reason": "insufficient eligible offers",
+                    })
+
+            # compute shipping totals (both)
+            shipping_normal = Decimal("0")
+            shipping_registered = Decimal("0")
+            shipping_unknown = False
+
+            store_summaries: List[Dict[str, Any]] = []
+            for sk, w in store_weight.items():
+                c_norm = _shipping_cost_from_bands(bands_normal, w) if w > 0 else Decimal("0")
+                c_reg = _shipping_cost_from_bands(bands_reg, w) if w > 0 else Decimal("0")
+                if c_norm is None or c_reg is None:
+                    shipping_unknown = True
+                    c_norm = c_norm or Decimal("0")
+                    c_reg = c_reg or Decimal("0")
+                shipping_normal += c_norm
+                shipping_registered += c_reg
+                store_summaries.append({
+                    "store_key": sk,
+                    "weight_mg": w,
+                    "shipping_normal_eur": str(c_norm),
+                    "shipping_registered_eur": str(c_reg),
+                    "n_allocs": len(store_allocs.get(sk, [])),
+                })
+            store_summaries.sort(key=lambda d: (d["store_key"]))
+
+            # choose scoring shipping based on scenario
+            shipping_score = shipping_normal if ship_service == "normal" else shipping_registered
+
+            total_score = totals["parts_cost"] + shipping_score + totals["penalty_store_total"] + totals["base_excess_penalty"] + totals["estimates_penalty"]
+            return {
+                "scenario": scn["name"],
+                "ship_service_for_score": ship_service,
+                "params": {
+                    "penalty_store": str(penalty_store),
+                    "base_excess_penalty": str(base_excess_penalty),
+                },
+                "snapshot_id": snapshot_id,
+                "n_stores_used": len(store_used),
+                "missing_items": missing,
+                "shipping_unknown": shipping_unknown,
+                "costs": {
+                    "parts_cost_eur": str(totals["parts_cost"]),
+                    "base_excess_penalty_eur": str(totals["base_excess_penalty"]),
+                    "estimates_penalty_eur": str(totals["estimates_penalty"]),
+                    "penalty_store_total_eur": str(totals["penalty_store_total"]),
+                    "shipping_normal_eur": str(shipping_normal),
+                    "shipping_registered_eur": str(shipping_registered),
+                    "shipping_score_eur": str(shipping_score),
+                    "total_score_eur": str(total_score),
+                },
+                "stores": store_summaries,
+                "allocations": store_allocs,
+            }
+
+        for scn in scenarios:
+            res = run_scenario(scn)
+            all_results["scenarios"].append(res)
+
+            # persist to DB
+            con.execute(
+                "INSERT OR REPLACE INTO solver_solutions(run_id, scenario, created_ts, snapshot_id, normalized_items_path, total_score_eur, total_parts_cost_eur, total_shipping_cost_eur, n_stores_used, missing_items, payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?);",
+                (
+                    run_id,
+                    res["scenario"],
+                    created_ts,
+                    snapshot_id,
+                    norm_path,
+                    res["costs"]["total_score_eur"],
+                    res["costs"]["parts_cost_eur"],
+                    res["costs"]["shipping_score_eur"],
+                    int(res["n_stores_used"]),
+                    int(len(res["missing_items"])),
+                    json.dumps(res, ensure_ascii=False),
+                ),
+            )
+
+        con.commit()
+        con.close()
+
+        out_path = out_dir / f"seed_solutions.{run_id}.json"
+        _write_json(str(out_path), all_results)
+
+        # light checkpoint (idempotent)
+        ck_dir = out_dir / "checkpoints"
+        ck_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(str(ck_dir / f"seed.{run_id}.json"), {"run_id": run_id, "created_ts": created_ts, "snapshot_id": snapshot_id})
+
+        logger.log("m3.solve.done", snapshot_id=snapshot_id, normalized_items_path=norm_path, scenarios=len(scenarios), output=str(out_path))
+
+        # commit/push if enabled
+        if getattr(cfg.github_sync, "enabled", True) and not args.no_commit:
+            sync_repo(
+                repo_root=cfg.paths.repo_root,
+                pull=False,
+                commit=not args.no_commit,
+                push=not args.no_push,
+                git_user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
+                git_user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
+                logger=logger,
+                commit_message=f"brickovery: solve seeds (run_id={run_id}, slice_id={slice_id}, snapshot_id={snapshot_id})",
+            )
+
+        return 0
+    finally:
+        lock.release()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="brickovery")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1163,6 +1653,25 @@ def build_parser() -> argparse.ArgumentParser:
     m2.add_argument("--lock-ttl-seconds", type=int, default=3600)
     m2.add_argument("--lock-wait-seconds", type=int, default=0)
     m2.set_defaults(func=cmd_refresh_cache)
+
+
+    s = sub.add_parser("solve", help="M3: greedy seed solver (3-5 scenarios) using market_offers + shipping bands")
+    s.add_argument("--config", required=True)
+    s.add_argument("--normalized-items", default=None)
+    s.add_argument("--output-dir", default="outputs/solver")
+    s.add_argument("--snapshot-id", default=None)
+    s.add_argument("--run-id", default=None)
+    s.add_argument("--slice-id", default="0")
+    s.add_argument("--penalty-store", type=int, default=3)
+    s.add_argument("--penalty-store-high", type=int, default=10)
+    s.add_argument("--base-excess-penalty", type=int, default=1)
+    s.add_argument("--base-excess-penalty-strict", type=int, default=5)
+    s.add_argument("--no-pull", action="store_true")
+    s.add_argument("--no-commit", action="store_true")
+    s.add_argument("--no-push", action="store_true")
+    s.add_argument("--lock-ttl-seconds", type=int, default=3600)
+    s.add_argument("--lock-wait-seconds", type=int, default=0)
+    s.set_defaults(func=cmd_solve)
 
     return p
 
