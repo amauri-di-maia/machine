@@ -1155,15 +1155,51 @@ def _load_normalized_items(path: Optional[str]) -> Tuple[str, List[Dict[str, Any
 
 
 def _dec(x: Optional[str]) -> Optional[Decimal]:
+    """Parse a money/number string into Decimal.
+
+    Accepts formats like:
+      - '0.12', '0,12'
+      - 'EUR 0.12', '~EUR 0,12', '€0,12'
+      - '1,234.56' or '1.234,56' (best-effort)
+    """
     if x is None:
         return None
+    s = str(x).strip()
+    if not s:
+        return None
+
+    # Normalize common currency/estimate markers
+    s = s.replace("\u00a0", " ")
+    s = s.replace("~", "")
+    s = s.replace("EUR", "")
+    s = s.replace("€", "")
+    s = s.strip()
+    s = s.replace(" ", "")
+
+    # Extract a plausible numeric token
+    m = re.search(r"-?\d[\d.,]*", s)
+    if not m:
+        return None
+    num = m.group(0)
+
+    # Heuristic for mixed separators
+    if "," in num and "." in num:
+        last_comma = num.rfind(",")
+        last_dot = num.rfind(".")
+        if last_comma > last_dot:
+            # comma is decimal separator
+            num = num.replace(".", "")
+            num = num.replace(",", ".")
+        else:
+            # dot is decimal separator
+            num = num.replace(",", "")
+    elif "," in num and "." not in num:
+        num = num.replace(",", ".")
+
     try:
-        return Decimal(str(x))
+        return Decimal(num)
     except Exception:
-        try:
-            return Decimal(x.replace(",", "."))
-        except Exception:
-            return None
+        return None
 
 
 def _shipping_bands(con, service_level: str, dest_country: str = "PT") -> List[Tuple[int, int, Decimal]]:
