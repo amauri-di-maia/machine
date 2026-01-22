@@ -1,6 +1,6 @@
 name: Brickovery - Bootstrap (M0)
 
-'on':
+on:
   workflow_dispatch:
     inputs:
       upstream_ref:
@@ -82,7 +82,6 @@ jobs:
           DB_PATH="data base/brickovery.db"
           test -f "${DB_PATH}"
           ls -la "${DB_PATH}"
-
           # Validate that the upstream file is a real SQLite DB (not LFS pointer / HTML / corrupt)
           python - <<'PY'
           from pathlib import Path
@@ -90,12 +89,10 @@ jobs:
           head = p.read_bytes()[:64]
           if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
               raise SystemExit("ERROR: upstream brickovery.db is a Git LFS pointer. Re-upload it as a normal file (no LFS) on the upstream ref/branch.")
-          if not head.startswith(b"SQLite format 3 "):
-              sample = head.decode("utf-8", errors="replace").replace("
-"," ").replace("
-"," ")
+          if not head.startswith(b"SQLite format 3"):
+              sample = head.decode("utf-8", errors="replace").replace(chr(10), " ").replace(chr(13), " ")
               raise SystemExit(f"ERROR: upstream brickovery.db is not SQLite. head_sample={sample!r}")
-          print("OK: upstream DB header is SQLite.")
+          print("OK: upstream DB header looks like SQLite.")
           PY
 
           DB_SHA="$(python - <<'PY'
