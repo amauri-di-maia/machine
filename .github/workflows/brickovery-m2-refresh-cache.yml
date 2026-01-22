@@ -251,7 +251,17 @@ jobs:
             platform    = it.get("platform") or "BL"
       
             where = "platform=? AND bl_itemtype=? AND bl_part_id=? AND bl_color_id=? AND condition=?"
-            params = (platform, bl_itemtype, bl_part_id, int(bl_color_id), cond)
+            # bl_color_id is mandatory for strict lot-level coverage, but debug must not crash.
+            if bl_color_id is None or str(bl_color_id).strip()=="":
+              print(f"WARN: missing bl_color_id for item {platform}:{bl_itemtype} {bl_part_id} cond={cond}; skipping")
+              continue
+            try:
+              bl_color_id_i = int(bl_color_id)
+            except Exception:
+              print(f"WARN: non-integer bl_color_id={bl_color_id!r} for item {platform}:{bl_itemtype} {bl_part_id} cond={cond}; skipping")
+              continue
+
+            params = (platform, bl_itemtype, bl_part_id, bl_color_id_i, cond)
       
             n_total = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where}", params).fetchone()["n"]
             n_ship  = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where} AND ships_to_me=1", params).fetchone()["n"]
