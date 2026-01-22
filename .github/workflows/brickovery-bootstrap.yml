@@ -42,24 +42,106 @@ jobs:
       - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
         env:
           UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
-          UPSTREAM_REPO: amauri-di-maia/amauri-repo
-          UPSTREAM_REF: main
-          GIT_LFS_SKIP_SMUDGE: "1"
         run: |
           set -euo pipefail
           cd repo
           rm -rf upstream/amauri-repo || true
           mkdir -p upstream
-          git clone --depth 1 "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" upstream/amauri-repo
+
+          # Read upstream settings from config (avoid hardcoding)
+          UPSTREAM_REPO="$(python - <<'PY'
+import re
+p='configs/config.v1.yaml'
+txt=open(p,'r',encoding='utf-8').read().splitlines()
+in_up=False
+indent=None
+repo=None
+ref=None
+db=None
+for line in txt:
+    if not in_up:
+        if re.match(r'^upstream\s*:\s*$', line.strip()):
+            in_up=True
+            continue
+    else:
+        # stop at next top-level key (non-indented)
+        if line and not line.startswith(' ') and not line.startswith('\t'):
+            break
+        m=re.match(r'^(\s*)([A-Za-z0-9_]+)\s*:\s*(.*)\s*$', line)
+        if not m:
+            continue
+        key=m.group(2)
+        val=m.group(3).strip().strip('"').strip("'")
+        if key=='repo':
+            repo=val
+        elif key=='ref':
+            ref=val
+        elif key in ('db_relpath','db_path','db'):
+            db=val
+print(repo or '')
+PY
+)"
+          UPSTREAM_REF="$(python - <<'PY'
+import re
+p='configs/config.v1.yaml'
+txt=open(p,'r',encoding='utf-8').read().splitlines()
+in_up=False
+ref=None
+for line in txt:
+    if not in_up:
+        if re.match(r'^upstream\s*:\s*$', line.strip()):
+            in_up=True
+            continue
+    else:
+        if line and not line.startswith(' ') and not line.startswith('\t'):
+            break
+        m=re.match(r'^\s*ref\s*:\s*(.*)\s*$', line)
+        if m:
+            ref=m.group(1).strip().strip('"').strip("'")
+            break
+print(ref or 'main')
+PY
+)"
+          UPSTREAM_DB_RELPATH="$(python - <<'PY'
+import re
+p='configs/config.v1.yaml'
+txt=open(p,'r',encoding='utf-8').read().splitlines()
+in_up=False
+db=None
+for line in txt:
+    if not in_up:
+        if re.match(r'^upstream\s*:\s*$', line.strip()):
+            in_up=True
+            continue
+    else:
+        if line and not line.startswith(' ') and not line.startswith('\t'):
+            break
+        m=re.match(r'^\s*db_relpath\s*:\s*(.*)\s*$', line)
+        if m:
+            db=m.group(1).strip().strip('"').strip("'")
+            break
+print(db or 'data base/brickovery.db')
+PY
+)"
+
+          echo "Upstream repo: ${UPSTREAM_REPO}"
+          echo "Upstream ref:  ${UPSTREAM_REF}"
+          echo "Upstream db:   ${UPSTREAM_DB_RELPATH}"
+
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" "upstream/amauri-repo"
           cd upstream/amauri-repo
-          # If you want deterministic pinning, set UPSTREAM_REF to a commit SHA instead of 'main'
-          if [ "${UPSTREAM_REF}" != "main" ]; then
-            git fetch --depth 1 origin "${UPSTREAM_REF}" || true
+
+          if [[ "${UPSTREAM_REF}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            git fetch --depth 1 origin "${UPSTREAM_REF}"
+            git checkout -q "${UPSTREAM_REF}"
+          else
+            git checkout -q "${UPSTREAM_REF}" || true
           fi
-          git checkout -q "${UPSTREAM_REF}" || git checkout -q "origin/${UPSTREAM_REF}"
-          test -f "data base/brickovery.db"
-          echo "OK: upstream DB present at upstream/amauri-repo/data base/brickovery.db"
-          file "data base/brickovery.db" || true
+
+          test -f "${UPSTREAM_DB_RELPATH}"
+          echo "OK: upstream DB present" 
+
 
       - name: Verify upstream schema (brickovery_db)
         run: |
