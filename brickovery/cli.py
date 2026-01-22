@@ -938,6 +938,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--config", required=True)
     b.add_argument("--run-id", default=None)
     b.add_argument("--slice-id", default="0")
+    b.add_argument("--upstream-checkout-path", default="upstream/amauri-repo")
     b.add_argument("--no-pull", action="store_true")
     b.add_argument("--no-commit", action="store_true")
     b.add_argument("--no-push", action="store_true")
