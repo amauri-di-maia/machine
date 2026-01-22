@@ -35,7 +35,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p upstream
-          rm -rf upstream/amauri-repo || true
           git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
 
       - name: Setup Python
@@ -49,6 +48,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import bs4; import requests; print('deps OK')"
 
       - name: Set RUN_ID
         run: echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
@@ -80,44 +80,59 @@ jobs:
           set -euo pipefail
           python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --snapshot-id "${RUN_ID}"             --ttl-hours "6"             --cookie-env-var "BRICKLINK_COOKIE"             --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
 
-      - name: Fail workflow if M2 refresh_report has errors
+      - name: Show last m2.error from jsonl logs
         if: always()
         working-directory: repo
+        run: |
+          set -euo pipefail
+          echo "== last m2.error events (if any) =="
+          if ls -1 "data base/logs"/*.jsonl >/dev/null 2>&1; then
+            tail -n 400 "data base/logs"/*.jsonl | grep -F '"m2.error"' | tail -n 20 || true
+          else
+            echo "No jsonl logs found under data base/logs"
+            find "data base" -maxdepth 3 -type f -name "*.jsonl" -print || true
+          fi
+
+      - name: BrickLink connectivity diagnostics (no secrets printed)
+        if: always()
+        working-directory: repo
+        env:
+          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json, glob, sys
-          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
-          if not paths:
-              print("ERROR: No outputs/market/refresh_report.*.json found")
-              sys.exit(1)
-          rp = paths[-1]
-          with open(rp, "r", encoding="utf-8") as f:
-              report = json.load(f)
-          errors = int(report.get("errors", 0))
-          refreshed = int(report.get("refreshed_items", 0))
-          skipped = int(report.get("skipped_items", 0))
-          print(f"refresh_report: {rp}")
-          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
-          if errors > 0:
-              sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
+          import os, requests
+          cookie = os.getenv("BRICKLINK_COOKIE","")
+          if not cookie:
+              print("BRICKLINK_COOKIE is EMPTY (secret not set or not passed)")
+              raise SystemExit(0)
+
+          s = requests.Session()
+          h = {
+              "User-Agent": "Mozilla/5.0",
+              "Accept": "text/html, */*; q=0.01",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": "https://www.bricklink.com/",
+              "Cookie": cookie,
+          }
+
+          tests = [
+              ("home", "https://www.bricklink.com/"),
+              ("catalogitem.page P=3005", "https://www.bricklink.com/v2/catalog/catalogitem.page?P=3005"),
+          ]
+
+          for name, url in tests:
+              try:
+                  r = s.get(url, headers=h, timeout=20, allow_redirects=False)
+                  loc = r.headers.get("Location")
+                  print(f"[{name}] status={r.status_code} location={loc}")
+                  body = (r.text or "")[:400].replace("\n"," ").replace("\r"," ")
+                  print(f"[{name}] body_snip={body!r}")
+              except Exception as e:
+                  print(f"[{name}] EXCEPTION: {e}")
           PY
 
-      - name: Commit and push (atomic)
-        if: always()
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "brickovery: M2 refresh-cache (run_id=${RUN_ID})"
-            git push origin "HEAD:${{ github.ref_name }}"
-          else
-            echo "No changes to commit."
-          fi
-
-      - name: Upload artifacts
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -129,3 +144,45 @@ jobs:
             repo/data base/manifests
             repo/data base/brickovery.db
           if-no-files-found: warn
+
+      - name: Fail workflow if M2 refresh_report has errors
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, glob, sys
+
+          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not paths:
+              print("ERROR: No outputs/market/refresh_report.*.json found")
+              sys.exit(1)
+
+          rp = paths[-1]
+          with open(rp, "r", encoding="utf-8") as f:
+              report = json.load(f)
+
+          errors = int(report.get("errors", 0))
+          refreshed = int(report.get("refreshed_items", 0))
+          skipped = int(report.get("skipped_items", 0))
+
+          print(f"refresh_report: {rp}")
+          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
+
+          if errors > 0:
+              sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
+          PY
+
+      - name: Commit and push (atomic)
+        if: success()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "brickovery: M2 refresh-cache (run_id=${RUN_ID})"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "No changes to commit."
+          fi
