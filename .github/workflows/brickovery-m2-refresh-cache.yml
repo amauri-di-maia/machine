@@ -28,7 +28,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-
       - name: Clone upstream repo (read-only)
         working-directory: repo
         env:
@@ -39,12 +38,10 @@ jobs:
           rm -rf upstream/amauri-repo || true
           git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
 
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
 
       - name: Install dependencies
         working-directory: repo
@@ -53,49 +50,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-
-- name: BrickLink connectivity diagnostics
-  working-directory: repo
-  env:
-    BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
-  run: |
-    set -euo pipefail
-    python - <<'PY'
-    import os
-    import requests
-
-    cookie = os.environ.get("BRICKLINK_COOKIE", "") or ""
-    print("BRICKLINK_COOKIE length:", len(cookie))
-
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    })
-    if cookie:
-        s.headers["Cookie"] = cookie
-
-    tests = [
-        ("home", "https://www.bricklink.com/"),
-        ("catalogitem_P3005", "https://www.bricklink.com/v2/catalog/catalogitem.page?P=3005"),
-    ]
-
-    for name, url in tests:
-        try:
-            r = s.get(url, timeout=30, allow_redirects=True)
-            txt = r.text or ""
-            snippet = " ".join(txt[:240].split())
-            print(f"[{name}] status={r.status_code} final_url={r.url} bytes={len(txt)}")
-            print(f"[{name}] snippet={snippet}")
-        except Exception as e:
-            print(f"[{name}] EXC={e!r}")
-    PY
-
       - name: Set RUN_ID
         run: echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
-
 
       - name: Verify inputs exist
         working-directory: repo
@@ -104,20 +60,17 @@ jobs:
           ls -la inputs || true
           test -f inputs/search.xml
 
-
       - name: M0 bootstrap
         working-directory: repo
         run: |
           set -euo pipefail
           python -m brickovery.cli bootstrap             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --upstream-checkout-path upstream/amauri-repo             --no-pull             --no-commit             --no-push
 
-
       - name: M1 normalize-input
         working-directory: repo
         run: |
           set -euo pipefail
           python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --input inputs/search.xml             --output-dir outputs/inputs
-
 
       - name: M2 refresh-cache (TTL 6h, strict EU+ships-to-PT)
         working-directory: repo
@@ -126,20 +79,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --snapshot-id "${RUN_ID}"             --ttl-hours "6"             --cookie-env-var "BRICKLINK_COOKIE"             --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
-
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: brickovery-m2
-          path: |
-            repo/outputs/inputs
-            repo/outputs/market
-            repo/data base/logs
-            repo/data base/manifests
-            repo/data base/brickovery.db
-          if-no-files-found: warn
 
       - name: Fail workflow if M2 refresh_report has errors
         if: always()
@@ -164,9 +103,8 @@ jobs:
               sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
           PY
 
-
       - name: Commit and push (atomic)
-        if: success()
+        if: always()
         working-directory: repo
         run: |
           set -euo pipefail
@@ -178,4 +116,16 @@ jobs:
           else
             echo "No changes to commit."
           fi
-          
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m2
+          path: |
+            repo/outputs/inputs
+            repo/outputs/market
+            repo/data base/logs
+            repo/data base/manifests
+            repo/data base/brickovery.db
+          if-no-files-found: warn
