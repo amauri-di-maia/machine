@@ -79,41 +79,54 @@ jobs:
         run: |
           set -euo pipefail
           python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --snapshot-id "${RUN_ID}"             --ttl-hours "6"             --cookie-env-var "BRICKLINK_COOKIE"             --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
-      - name: Show last m2.error events (jsonl)
+      - name: Show current run log (m2.error if any)
         if: always()
         working-directory: repo
+        env:
+          RUN_ID: ${{ env.RUN_ID }}
         run: |
           set -euo pipefail
-
+      
           LOG_DIR="data base/logs"
           echo "LOG_DIR=$LOG_DIR"
-
+          echo "RUN_ID=${RUN_ID:-}"
+      
           if [ ! -d "$LOG_DIR" ]; then
             echo "No log dir found: $LOG_DIR"
-            echo "Searching for any jsonl files..."
-            find . -maxdepth 6 -type f -name "*.jsonl" -print || true
             exit 0
           fi
-
-          # Collect slice jsonl files safely even with spaces in paths
-          mapfile -d '' files < <(find "$LOG_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
-
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No slice-*.jsonl found under: $LOG_DIR"
-            find "$LOG_DIR" -maxdepth 6 -type f -print || true
+      
+          # Prefer the current run log. If missing, fall back to the newest slice-0.jsonl.
+          LOG_FILE="$(python - <<'PY'
+      import os, glob
+      log_dir = "data base/logs"
+      run_id = os.getenv("RUN_ID","").strip()
+      cand = ""
+      if run_id:
+          p = os.path.join(log_dir, f"run-{run_id}", "slice-0.jsonl")
+          if os.path.exists(p):
+              cand = p
+      if not cand:
+          paths = glob.glob(os.path.join(log_dir, "run-*", "slice-0.jsonl"))
+          paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+          cand = paths[0] if paths else ""
+      print(cand)
+      PY
+          )"
+      
+          if [ -z "$LOG_FILE" ]; then
+            echo "No slice-0.jsonl found under: $LOG_DIR"
             exit 0
           fi
-
-          echo "== last m2.error events (if any) =="
-          for f in "${files[@]}"; do
-            echo "--- $f ---"
-            if grep -q '"event":"m2.error"' "$f"; then
-              grep '"event":"m2.error"' "$f" | tail -n 10
-            else
-              echo "(no m2.error entries; tail last 30 lines)"
-              tail -n 30 "$f" || true
-            fi
-          done
+      
+          echo "--- $LOG_FILE ---"
+          if grep -q '"event":"m2.error"' "$LOG_FILE"; then
+            echo "m2.error entries:"
+            grep '"event":"m2.error"' "$LOG_FILE" | tail -n 20
+          else
+            echo "(no m2.error entries; tail last 50 lines)"
+            tail -n 50 "$LOG_FILE" || true
+          fi
 
       - name: BrickLink connectivity diagnostics (no secrets printed) (no secrets printed)
         if: always()
