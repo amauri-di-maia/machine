@@ -62,6 +62,22 @@ jobs:
           test -f "data base/shipping_normal.txt" || true
           test -f "data base/shipping_registered.txt" || true
 
+      - name: Normalize input (ensure current search.xml is used)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+
+      - name: Select latest normalized_items path
+        id: norm
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json | head -n 1)"
+          echo "path=$latest_norm" >> "$GITHUB_OUTPUT"
+          echo "normalized_items_path=$latest_norm"
+
       - name: Run M2 refresh-cache
         working-directory: repo
         env:
@@ -80,7 +96,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python - <<'PY'
+          NORM_PATH="$latest_norm" python - <<'PY'
           import json, glob, sys
           paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
           if not paths:
@@ -103,7 +119,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python - <<'PY'
+          NORM_PATH="$latest_norm" python - <<'PY'
           import sqlite3, sys
           from pathlib import Path
 
@@ -178,16 +194,16 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="$PWD"
       
-          # Ensure we have a normalized_items file to read item keys from
-          latest_norm="$(ls -1 outputs/inputs/normalized_items.*.json 2>/dev/null | sort | tail -n 1 || true)"
-          if [ -z "$latest_norm" ]; then
-            echo "No normalized_items.*.json found; running normalize-input to generate one for diagnostics."
-            python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
-            latest_norm="$(ls -1 outputs/inputs/normalized_items.*.json | sort | tail -n 1)"
+          # Use the normalized_items generated in this run (from the normalize-input step)
+          latest_norm="${{ steps.norm.outputs.path }}"
+          if [ -z "$latest_norm" ] || [ ! -f "$latest_norm" ]; then
+            echo "ERROR: normalized_items path not found (normalize step may have failed)."
+            ls -la outputs/inputs || true
+            exit 1
           fi
           echo "normalized_items_for_debug=$latest_norm"
-      
-          python - <<'PY'
+
+          NORM_PATH="$latest_norm" python - <<'PY'
           import json, sqlite3
           from pathlib import Path
       
@@ -206,16 +222,19 @@ jobs:
           eu_list = sorted(EU)
           eu_ph = ",".join(["?"]*len(eu_list))
       
-          norm_path = Path(open("normalized_items_for_debug.txt","r").read().strip()) if Path("normalized_items_for_debug.txt").exists() else None
-          # Fallback: read from env printed in bash isn't accessible; read again from filesystem
-          import glob
-          paths = sorted(glob.glob("outputs/inputs/normalized_items.*.json"))
-          norm_path = Path(paths[-1]) if paths else None
+          import os, glob
+          norm_path = Path(os.environ.get("NORM_PATH","").strip())
+          if not norm_path or not norm_path.exists():
+            paths = sorted(glob.glob("outputs/inputs/normalized_items.*.json"))
+            norm_path = Path(paths[-1]) if paths else None
           if not norm_path or not norm_path.exists():
             raise SystemExit("Coverage debug: missing normalized_items file.")
-      
+
           data = json.load(norm_path.open("r", encoding="utf-8"))
-          items = data.get("items") or data  # tolerate either {items:[...]} or [...]
+          if isinstance(data, dict):
+            items = data.get("items") or data.get("normalized_items") or []
+          else:
+            items = data  # list
           print(f"Coverage debug: {len(items)} requested items")
       
           for it in items:
