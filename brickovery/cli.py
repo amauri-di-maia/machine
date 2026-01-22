@@ -830,17 +830,54 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
         skipped = 0
         errors = 0
 
+        now_dt = datetime.now(timezone.utc)
+        item_reports: List[Dict[str, Any]] = []
+
+        def _age_minutes(ts: Optional[str]) -> Optional[int]:
+            if not ts:
+                return None
+            try:
+                dt = _parse_iso(ts)
+                return int((now_dt - dt).total_seconds() // 60)
+            except Exception:
+                return None
+
         for it in items:
             itype = it["bl_itemtype"]
             pid = it["bl_part_id"]
             cid = it.get("bl_color_id")
+
             if cid is None:
                 skipped += 1
+                item_reports.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": None,
+                    "action": "skipped",
+                    "reason": "missing_color_id",
+                    "force": bool(args.force),
+                })
                 continue
-            cid = int(cid)
 
-            if not args.force and _fresh(_last_ts(itype, pid, cid, "N")) and _fresh(_last_ts(itype, pid, cid, "U")):
+            cid = int(cid)
+            last_ts_n = _last_ts(itype, pid, cid, "N")
+            last_ts_u = _last_ts(itype, pid, cid, "U")
+
+            if not args.force and _fresh(last_ts_n) and _fresh(last_ts_u):
                 skipped += 1
+                item_reports.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": cid,
+                    "action": "skipped",
+                    "reason": "fresh_by_ttl",
+                    "force": bool(args.force),
+                    "last_fetched_ts_n": last_ts_n,
+                    "last_fetched_ts_u": last_ts_u,
+                    "age_minutes_n": _age_minutes(last_ts_n),
+                    "age_minutes_u": _age_minutes(last_ts_u),
+                    "ttl_hours": ttl_hours,
+                })
                 continue
 
             try:
@@ -917,9 +954,46 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 upsert("N", "new", lots_n, qty_n, minp_n, minp_est_n, offers_n)
                 upsert("U", "used", lots_u, qty_u, minp_u, minp_est_u, offers_u)
 
+                item_reports.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": cid,
+                    "action": "refreshed",
+                    "reason": None,
+                    "force": bool(args.force),
+                    "id_item": id_item,
+                    "fetched_ts": fetched_ts,
+                    "sold_6m_new_qty": sold.get("new", {}).get("qty"),
+                    "sold_6m_new_avg_eur": str(sold.get("new", {}).get("avg")) if sold.get("new", {}).get("avg") is not None else None,
+                    "sold_6m_used_qty": sold.get("used", {}).get("qty"),
+                    "sold_6m_used_avg_eur": str(sold.get("used", {}).get("avg")) if sold.get("used", {}).get("avg") is not None else None,
+                    "current_new_total_lots": lots_n,
+                    "current_new_total_qty": qty_n,
+                    "current_new_min_price_eur": str(minp_n) if minp_n is not None else None,
+                    "current_new_min_price_is_estimate": bool(minp_est_n) if minp_est_n is not None else None,
+                    "current_used_total_lots": lots_u,
+                    "current_used_total_qty": qty_u,
+                    "current_used_min_price_eur": str(minp_u) if minp_u is not None else None,
+                    "current_used_min_price_is_estimate": bool(minp_est_u) if minp_est_u is not None else None,
+                })
+
                 refreshed += 1
             except Exception as e:
                 errors += 1
+                item_reports.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": cid,
+                    "action": "error",
+                    "reason": "exception",
+                    "force": bool(args.force),
+                    "error": str(e),
+                    "last_fetched_ts_n": last_ts_n,
+                    "last_fetched_ts_u": last_ts_u,
+                    "age_minutes_n": _age_minutes(last_ts_n),
+                    "age_minutes_u": _age_minutes(last_ts_u),
+                    "ttl_hours": ttl_hours,
+                })
                 logger.log("m2.error", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, error=str(e))
 
         con.commit()
@@ -940,9 +1014,11 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "cookie_env_var": args.cookie_env_var,
             "parser_version": parser_version,
             "data_source": data_source,
+            "items": item_reports,
         }
         _write_json(str(out_dir / f"refresh_report.{run_id}.json"), report)
-        logger.log("m2.done", **report)
+        # Não logar "items" inteiro (pode ser grande). Logar apenas resumo.
+        logger.log("m2.done", **{k: v for k, v in report.items() if k != "items"}, items_count=len(item_reports))
 
         return 0
     finally:
