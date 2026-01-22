@@ -35,6 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p upstream
+          rm -rf upstream/amauri-repo || true
           git clone "https://x-access-token:${UP_TOKEN}@github.com/amauri-di-maia/amauri-repo.git" upstream/amauri-repo
 
       - name: Setup Python
@@ -50,32 +51,26 @@ jobs:
           pip install -r requirements.txt
 
       - name: Set RUN_ID
-        id: runid
         run: echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
+
+      - name: Verify inputs exist
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la inputs || true
+          test -f inputs/search.xml
 
       - name: M0 bootstrap
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m brickovery.cli bootstrap \
-            --config configs/config.v1.yaml \
-            --run-id "${RUN_ID}" \
-            --slice-id "0" \
-            --upstream-checkout-path upstream/amauri-repo \
-            --no-push \
-            --no-commit
+          python -m brickovery.cli bootstrap             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --upstream-checkout-path upstream/amauri-repo             --no-pull             --no-commit             --no-push
 
       - name: M1 normalize-input
         working-directory: repo
         run: |
           set -euo pipefail
-          test -f inputs/search.xml
-          python -m brickovery.cli normalize-input \
-            --config configs/config.v1.yaml \
-            --run-id "${RUN_ID}" \
-            --slice-id "0" \
-            --input inputs/search.xml \
-            --output-dir outputs/inputs
+          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --input inputs/search.xml             --output-dir outputs/inputs
 
       - name: M2 refresh-cache (TTL 6h, strict EU+ships-to-PT)
         working-directory: repo
@@ -83,16 +78,33 @@ jobs:
           BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
         run: |
           set -euo pipefail
-          python -m brickovery.cli refresh-cache \
-            --config configs/config.v1.yaml \
-            --run-id "${RUN_ID}" \
-            --slice-id "0" \
-            --snapshot-id "${RUN_ID}" \
-            --ttl-hours "6" \
-            --cookie-env-var "BRICKLINK_COOKIE" \
-            --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
+          python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --run-id "${RUN_ID}"             --slice-id "0"             --snapshot-id "${RUN_ID}"             --ttl-hours "6"             --cookie-env-var "BRICKLINK_COOKIE"             --normalized-items "outputs/inputs/normalized_items.${RUN_ID}.json"
+
+      - name: Fail workflow if M2 refresh_report has errors
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, glob, sys
+          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not paths:
+              print("ERROR: No outputs/market/refresh_report.*.json found")
+              sys.exit(1)
+          rp = paths[-1]
+          with open(rp, "r", encoding="utf-8") as f:
+              report = json.load(f)
+          errors = int(report.get("errors", 0))
+          refreshed = int(report.get("refreshed_items", 0))
+          skipped = int(report.get("skipped_items", 0))
+          print(f"refresh_report: {rp}")
+          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
+          if errors > 0:
+              sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
+          PY
 
       - name: Commit and push (atomic)
+        if: always()
         working-directory: repo
         run: |
           set -euo pipefail
