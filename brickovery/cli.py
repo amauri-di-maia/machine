@@ -147,7 +147,36 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         logger.log("db.migrated", db_path=cfg.paths.sqlite_db)
 
         # Ingest upstream mapping (mirror + overrides tables, upstream_state)
-        up_res = ingest_upstream_mapping(con, cfg)
+        # FIX: ingest_upstream_mapping expects explicit upstream args (checkout path, relpath, repo, ref, schema_hint)
+        raw_hint = getattr(getattr(cfg, "upstream", None), "schema_hint", None)
+        if raw_hint is None:
+            schema_hint = {}
+        elif isinstance(raw_hint, dict):
+            schema_hint = raw_hint
+        elif hasattr(raw_hint, "model_dump"):
+            schema_hint = raw_hint.model_dump()
+        elif hasattr(raw_hint, "dict"):
+            schema_hint = raw_hint.dict()
+        else:
+            try:
+                schema_hint = dict(raw_hint)
+            except Exception:
+                schema_hint = {}
+
+        upstream_checkout_path = (
+            os.getenv("UPSTREAM_CHECKOUT_PATH")
+            or getattr(getattr(cfg, "upstream", None), "checkout_path", None)
+            or "upstream/amauri-repo"
+        )
+
+        up_res = ingest_upstream_mapping(
+            con_work=con,
+            upstream_checkout_path=upstream_checkout_path,
+            upstream_db_relpath=cfg.upstream.db_relpath,
+            upstream_repo=cfg.upstream.repo,
+            upstream_ref=cfg.upstream.ref,
+            schema_hint=schema_hint,
+        )
         logger.log("upstream.ingested", **up_res)
 
         # Shipping
