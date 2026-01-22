@@ -1,60 +1,31 @@
-name: Brickovery - M2 Refresh Market Cache
+name: Brickovery - M2 Refresh Cache
 
 on:
   workflow_dispatch:
-    inputs:
-      note:
-        description: "Optional note (no effect)."
-        required: false
-        default: ""
 
 concurrency:
-  group: brickovery-m2-main
+  group: brickovery-m2-refresh-cache
   cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  m2:
+  refresh_cache:
     runs-on: ubuntu-latest
-    env:
-      # RUN_ID used by Brickovery logs/outputs; keep UTC, deterministic format
-      RUN_ID: ${{ github.run_id }}
-
     steps:
-      - name: Checkout machine repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Clone upstream repo (read-only)
+      - name: Clone repo manually
         env:
-          UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
-          UPSTREAM_REPO: amauri-di-maia/amauri-repo
-          UPSTREAM_REF: main
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          rm -rf "upstream/amauri-repo" || true
-          mkdir -p upstream
-          git clone --depth 1 --branch "${UPSTREAM_REF}" "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" "upstream/amauri-repo"
-          echo "UPSTREAM_COMMIT_SHA=$(git -C upstream/amauri-repo rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Verify upstream brickovery.db is SQLite
-        run: |
-          set -euo pipefail
-          DB="upstream/amauri-repo/data base/brickovery.db"
-          ls -la "$DB"
-          python - <<'PY'
-          p="upstream/amauri-repo/data base/brickovery.db"
-          with open(p,"rb") as f:
-              head=f.read(16)
-          if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
-              raise SystemExit("Upstream DB is a Git LFS pointer (not SQLite). Re-upload brickovery.db without LFS.")
-          if not head.startswith(b"SQLite format 3\0"):
-              raise SystemExit(f"Upstream DB is not SQLite. Header={head!r}")
-          print("OK: upstream DB is SQLite.")
-          PY
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git checkout "${BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -62,56 +33,38 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+          pip install -r requirements.txt
           sudo apt-get update
           sudo apt-get install -y sqlite3
 
+      - name: Verify input files exist
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la "inputs" || true
+          test -f "inputs/search.xml"
+          test -f "data base/rarity_rules.txt" || true
+          test -f "data base/shipping_normal.txt" || true
+          test -f "data base/shipping_registered.txt" || true
+
       - name: Run M2 refresh-cache
+        working-directory: repo
         env:
           BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          mkdir -p outputs/market
-          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml --output-dir outputs/market
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
+          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml
 
-      - name: Show last m2.error events (this run)
+      - name: Check refresh_report result
         if: always()
-        run: |
-          set -euo pipefail
-          LOG_DIR="data base/logs/run-${RUN_ID}"
-          echo "RUN_ID=${RUN_ID}"
-          echo "UPSTREAM_COMMIT_SHA=${UPSTREAM_COMMIT_SHA:-}"
-          echo "LOG_DIR=${LOG_DIR}"
-
-          if [ ! -d "$LOG_DIR" ]; then
-            echo "No log dir found for this run. Listing available logs:"
-            find "data base/logs" -maxdepth 3 -type f -name "*.jsonl" -print || true
-            exit 0
-          fi
-
-          mapfile -d '' files < <(find "$LOG_DIR" -type f -name "*.jsonl" -print0 | sort -z)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No jsonl files found under: $LOG_DIR"
-            find "$LOG_DIR" -type f -print || true
-            exit 0
-          fi
-
-          echo "== m2.error (if any) =="
-          for f in "${files[@]}"; do
-            if grep -q '"event":"m2.error"' "$f"; then
-              echo "--- $f ---"
-              grep '"event":"m2.error"' "$f" | tail -n 50 || true
-            fi
-          done
-
-      - name: Verify refresh_report exists and fail if errors>0
-        if: always()
+        working-directory: repo
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -121,8 +74,7 @@ jobs:
               print("ERROR: No outputs/market/refresh_report.*.json found")
               sys.exit(1)
           rp = paths[-1]
-          with open(rp, "r", encoding="utf-8") as f:
-              report = json.load(f)
+          report = json.load(open(rp,"r",encoding="utf-8"))
           errors = int(report.get("errors", 0))
           refreshed = int(report.get("refreshed_items", 0))
           skipped = int(report.get("skipped_items", 0))
@@ -132,11 +84,51 @@ jobs:
               sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
           PY
 
-      - name: Upload artifacts
+      - name: Show last m2.error events (jsonl)
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          # Prefer the RUN_ID we generated above (timestamp). If not present, fall back to newest run-* dir.
+          RID="${RUN_ID:-}"
+          LOG_ROOT="data base/logs"
+
+          if [ -n "$RID" ] && [ -d "${LOG_ROOT}/run-${RID}" ]; then
+            TARGET_DIR="${LOG_ROOT}/run-${RID}"
+          else
+            TARGET_DIR="$(ls -1d "${LOG_ROOT}"/run-* 2>/dev/null | sort | tail -n 1 || true)"
+          fi
+
+          echo "TARGET_LOG_DIR=${TARGET_DIR}"
+          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+            echo "No log dir found. Listing available logs:"
+            find "$LOG_ROOT" -maxdepth 3 -type f -name "slice-*.jsonl" -print || true
+            exit 0
+          fi
+
+          mapfile -d '' files < <(find "$TARGET_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No slice-*.jsonl found under: $TARGET_DIR"
+            find "$TARGET_DIR" -maxdepth 3 -type f -print || true
+            exit 0
+          fi
+
+          echo "== last m2.error events (if any) =="
+          for f in "${files[@]}"; do
+            echo "--- $f ---"
+            if grep -q '"event":"m2.error"' "$f"; then
+              grep '"event":"m2.error"' "$f" | tail -n 20
+            else
+              echo "(no m2.error entries; tail last 40 lines)"
+              tail -n 40 "$f" || true
+            fi
+          done
+
+      - name: Upload artifacts (outputs + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: brickovery-m2
           path: |
-            outputs/market/**
-            data base/logs/**
+            repo/outputs/**
+            repo/data base/logs/**
