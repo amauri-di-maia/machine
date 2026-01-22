@@ -1,0 +1,14 @@
+[
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "3005",
+    "bl_color_id": 80,
+    "condition": "U",
+    "qty": 1,
+    "bo_boid": "656416-20",
+    "weight_mg": 440,
+    "mapping_source": "override",
+    "mapping_status": "OK",
+    "weight_status": "OK"
+  }
+]
