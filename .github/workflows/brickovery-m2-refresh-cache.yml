@@ -86,12 +86,19 @@ jobs:
         run: |
           set -euo pipefail
           echo "== last m2.error events (if any) =="
-          if ls -1 "data base/logs"/*.jsonl >/dev/null 2>&1; then
-            tail -n 400 "data base/logs"/*.jsonl | grep -F '"m2.error"' | tail -n 20 || true
-          else
+          LOGS=$(find "data base/logs" -type f -name "*.jsonl" | sort || true)
+          if [ -z "${LOGS}" ]; then
             echo "No jsonl logs found under data base/logs"
-            find "data base" -maxdepth 3 -type f -name "*.jsonl" -print || true
+            find "data base" -maxdepth 5 -type f -name "*.jsonl" -print || true
+            exit 0
           fi
+
+          # Limit output: inspect only the last few log files
+          TAIL_LOGS=$(echo "${LOGS}" | tail -n 3)
+          for f in ${TAIL_LOGS}; do
+            echo "--- ${f} ---"
+            tail -n 400 "${f}" | grep -F '"event":"m2.error"' || true
+          done | tail -n 80
 
       - name: BrickLink connectivity diagnostics (no secrets printed)
         if: always()
@@ -101,69 +108,35 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re, requests
-          
-          cookie = os.getenv("BRICKLINK_COOKIE", "").strip()
-          
+          import os, requests
+          cookie = os.getenv("BRICKLINK_COOKIE","")
+          if not cookie:
+              print("BRICKLINK_COOKIE is EMPTY (secret not set or not passed)")
+              raise SystemExit(0)
+
           s = requests.Session()
           h = {
               "User-Agent": "Mozilla/5.0",
               "Accept": "text/html, */*; q=0.01",
               "X-Requested-With": "XMLHttpRequest",
               "Referer": "https://www.bricklink.com/v2/main.page",
+              "Cookie": cookie,
           }
-          if cookie:
-              h["Cookie"] = cookie
-          else:
-              print("NOTE: BRICKLINK_COOKIE is empty; running public connectivity checks only.")
-          
-          def req(name, url, *, params=None, timeout=25):
+
+          tests = [
+              ("home", "https://www.bricklink.com/v2/main.page"),
+              ("catalogitem.page P=3005", "https://www.bricklink.com/v2/catalog/catalogitem.page?P=3005"),
+          ]
+
+          for name, url in tests:
               try:
-                  r = s.get(url, params=params, headers=h, timeout=timeout, allow_redirects=False)
+                  r = s.get(url, headers=h, timeout=20, allow_redirects=False)
                   loc = r.headers.get("Location")
-                  body = (r.text or "")[:260].replace("\n", " ").replace("\r", " ")
-                  print(f"[{name}] status={r.status_code} location={loc} url={r.url}")
+                  print(f"[{name}] status={r.status_code} location={loc}")
+                  body = (r.text or "")[:400].replace("\n"," ").replace("\r"," ")
                   print(f"[{name}] body_snip={body!r}")
-                  return r
               except Exception as e:
                   print(f"[{name}] EXCEPTION: {e}")
-                  return None
-          
-          # 0) main page (avoid redirect noise)
-          req("main.page", "https://www.bricklink.com/v2/main.page")
-          
-          # 1) catalog item (public) to extract idItem
-          r_item = req("catalogitem.page P=3005", "https://www.bricklink.com/v2/catalog/catalogitem.page", params={"P": "3005"})
-          html = (r_item.text if r_item is not None else "") or ""
-          
-          m = (
-              re.search(r"idItem\s*=\s*(\d+)", html)
-              or re.search(r"idItem\s*:\s*(\d+)", html)
-              or re.search(r'"idItem"\s*:\s*(\d+)', html)
-              or re.search(r"idItem=(\d+)", html)
-          )
-          id_item = m.group(1) if m else None
-          print(f"[catalogitem] parsed idItem={id_item!r}")
-          
-          if not id_item:
-              print("ERROR: could not parse idItem from catalogitem.page HTML. This is often the root cause of M2 failures.")
-          else:
-              # 2) sold 6m (BASE_VALUE source)
-              req(
-                  "priceGuideSummary (sold6m)",
-                  "https://www.bricklink.com/priceGuideSummary.asp",
-                  params={"a": "P", "itemID": id_item, "colorID": "80", "vatInc": "Y", "vcID": "2"},
-                  timeout=25,
-              )
-          
-              # 3) current offers tab (st=1 new, st=2 used)
-              for st in ("1", "2"):
-                  req(
-                      f"catalogitem_pgtab (offers st={st})",
-                      "https://www.bricklink.com/v2/catalog/catalogitem_pgtab.page",
-                      params={"idItem": id_item, "idColor": "80", "st": st, "showflag": "1", "currency": "2", "prec": "3"},
-                      timeout=30,
-                  )
           PY
 
       - name: Upload artifacts (always)
