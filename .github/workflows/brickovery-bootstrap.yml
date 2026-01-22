@@ -42,15 +42,24 @@ jobs:
       - name: Clone upstream repo (read-only) into repo/upstream/amauri-repo
         env:
           UP_TOKEN: ${{ secrets.UPSTREAM_REPO_TOKEN }}
+          UPSTREAM_REPO: amauri-di-maia/amauri-repo
+          UPSTREAM_REF: main
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: |
           set -euo pipefail
           cd repo
           rm -rf upstream/amauri-repo || true
           mkdir -p upstream
-          git clone "https://github.com/amauri-di-maia/amauri-repo/blob/12cf75d956779d4cc33539e9a2725490d9a955db/data%20base/brickovery.db"
+          git clone --depth 1 "https://x-access-token:${UP_TOKEN}@github.com/${UPSTREAM_REPO}.git" upstream/amauri-repo
           cd upstream/amauri-repo
-          git checkout 729a81bc66ed40d77807588a9fb15b912ef93e8710c2f676f28752f20fbf695e
-
+          # If you want deterministic pinning, set UPSTREAM_REF to a commit SHA instead of 'main'
+          if [ "${UPSTREAM_REF}" != "main" ]; then
+            git fetch --depth 1 origin "${UPSTREAM_REF}" || true
+          fi
+          git checkout -q "${UPSTREAM_REF}" || git checkout -q "origin/${UPSTREAM_REF}"
+          test -f "data base/brickovery.db"
+          echo "OK: upstream DB present at upstream/amauri-repo/data base/brickovery.db"
+          file "data base/brickovery.db" || true
 
       - name: Verify upstream schema (brickovery_db)
         run: |
