@@ -309,3 +309,4 @@ PY
             repo/data base/brickovery.db
             repo/data base/upstream_schema_report.txt
           if-no-files-found: warn
+          
