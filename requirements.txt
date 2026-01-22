@@ -1,3 +1,4 @@
-pydantic>=2.6
-PyYAML>=6.0
+PyYAML
+pydantic
 beautifulsoup4
+requests
