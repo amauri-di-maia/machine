@@ -71,6 +71,32 @@ jobs:
             test -f "${{ inputs.normalized_items }}"
           fi
 
+      - name: Verify inputs/search.xml (hash + size)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          ls -la inputs || true
+          test -f inputs/search.xml
+          echo "search.xml sha256:"
+          sha256sum inputs/search.xml
+          echo "search.xml lines:"
+          wc -l inputs/search.xml || true
+
+      - name: Normalize input (if not provided) -> outputs/inputs
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          if [ -z "${{ inputs.normalized_items }}" ]; then
+            export PYTHONPATH="$PWD"
+            mkdir -p outputs/inputs
+            python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+            echo "Latest normalized_items:"
+            ls -1 outputs/inputs/normalized_items.*.json 2>/dev/null | sort | tail -n 1 || true
+          else
+            echo "normalized_items provided via workflow input: ${{ inputs.normalized_items }}"
+          fi
+
+
       - name: M3 solve seeds
         working-directory: repo
         env:
