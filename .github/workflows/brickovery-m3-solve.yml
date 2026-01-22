@@ -71,31 +71,42 @@ jobs:
             test -f "${{ inputs.normalized_items }}"
           fi
 
-      - name: Verify inputs/search.xml (hash + size)
+      - name: Resolve snapshot_id (default = latest refresh_report / DB)
+        id: snap
         working-directory: repo
+        env:
+          SNAP_IN: ${{ inputs.snapshot_id }}
         run: |
           set -euo pipefail
-          ls -la inputs || true
-          test -f inputs/search.xml
-          echo "search.xml sha256:"
-          sha256sum inputs/search.xml
-          echo "search.xml lines:"
-          wc -l inputs/search.xml || true
 
-      - name: Normalize input (if not provided) -> outputs/inputs
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          if [ -z "${{ inputs.normalized_items }}" ]; then
-            export PYTHONPATH="$PWD"
-            mkdir -p outputs/inputs
-            python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
-            echo "Latest normalized_items:"
-            ls -1 outputs/inputs/normalized_items.*.json 2>/dev/null | sort | tail -n 1 || true
-          else
-            echo "normalized_items provided via workflow input: ${{ inputs.normalized_items }}"
+          if [ -n "${SNAP_IN}" ]; then
+            echo "snapshot_id=${SNAP_IN}" >> "$GITHUB_OUTPUT"
+            echo "Using snapshot_id from workflow input: ${SNAP_IN}"
+            exit 0
           fi
 
+          rp="$(ls -1t outputs/market/refresh_report.*.json 2>/dev/null | head -n 1 || true)"
+          if [ -n "${rp}" ]; then
+            sid="$(python -c "import json,sys; d=json.load(open(sys.argv[1],'r',encoding='utf-8')); print((d.get('snapshot_id') or d.get('run_id') or '').strip())" "${rp}")"
+            if [ -n "${sid}" ]; then
+              echo "snapshot_id=${sid}" >> "$GITHUB_OUTPUT"
+              echo "Using snapshot_id from ${rp}: ${sid}"
+              exit 0
+            fi
+          fi
+
+          if [ -f "data base/brickovery.db" ]; then
+            sid="$(sqlite3 "data base/brickovery.db" "SELECT snapshot_id FROM market_snapshots ORDER BY created_ts DESC LIMIT 1;" 2>/dev/null || true)"
+            sid="$(echo "${sid}" | tr -d '\r' | tr -d '\n')"
+            if [ -n "${sid}" ]; then
+              echo "snapshot_id=${sid}" >> "$GITHUB_OUTPUT"
+              echo "Using snapshot_id from DB market_snapshots: ${sid}"
+              exit 0
+            fi
+          fi
+
+          echo "snapshot_id=" >> "$GITHUB_OUTPUT"
+          echo "No snapshot_id resolved; solver will rely on internal defaults."
 
       - name: M3 solve seeds
         working-directory: repo
@@ -103,6 +114,7 @@ jobs:
           SNAPSHOT_ID: ${{ inputs.snapshot_id }}
           NORMALIZED_ITEMS: ${{ inputs.normalized_items }}
         run: |
+          SNAPSHOT_ID="${{ steps.snap.outputs.snapshot_id }}"
           set -euo pipefail
           export PYTHONPATH="$PWD"
           ARGS=()
@@ -122,6 +134,7 @@ jobs:
           latest=$(ls -1 outputs/solver/seed_solutions.*.json 2>/dev/null | sort | tail -n 1 || true)
           if [ -n "${latest}" ]; then
             echo "latest: ${latest}"
+            echo "resolved_snapshot_id: ${{ steps.snap.outputs.snapshot_id }}"
             python -c 'import json,glob; p=sorted(glob.glob("outputs/solver/seed_solutions.*.json"))[-1]; data=json.load(open(p,"r",encoding="utf-8")); print("run_id:",data.get("run_id")); print("snapshot_id:",data.get("snapshot_id")); sc=data.get("scenarios") or []; print("scenarios:",len(sc)); [print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or [])) for s in sc]'
           fi
 
