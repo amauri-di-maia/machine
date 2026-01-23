@@ -252,15 +252,15 @@ jobs:
       
             where = "platform=? AND bl_itemtype=? AND bl_part_id=? AND bl_color_id=? AND condition=?"
             # bl_color_id is mandatory for strict lot-level coverage, but debug must not crash.
+            # Normalização de bl_color_id: alguns ITEMTYPE não têm cor aplicável; para coverage debug nunca fazemos skip.
+            # None/''/inválido -> 0 (convenção BrickLink).
             if bl_color_id is None or str(bl_color_id).strip()=="":
-              print(f"WARN: missing bl_color_id for item {platform}:{bl_itemtype} {bl_part_id} cond={cond}; skipping")
-              continue
-            try:
-              bl_color_id_i = int(bl_color_id)
-            except Exception:
-              print(f"WARN: non-integer bl_color_id={bl_color_id!r} for item {platform}:{bl_itemtype} {bl_part_id} cond={cond}; skipping")
-              continue
-
+              bl_color_id_i = 0
+            else:
+              try:
+                bl_color_id_i = int(str(bl_color_id).strip())
+              except Exception:
+                bl_color_id_i = 0
             params = (platform, bl_itemtype, bl_part_id, bl_color_id_i, cond)
       
             n_total = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where}", params).fetchone()["n"]
