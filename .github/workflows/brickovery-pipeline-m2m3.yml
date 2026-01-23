@@ -188,24 +188,24 @@ jobs:
           PENALTY_RAW="${{ github.event.inputs.penalty_store }}"
           export PENALTY_RAW
           PENALTY_STORE="$(python - <<'PY'
-import os, math
-raw = (os.getenv('PENALTY_RAW') or '').strip().replace(',', '.')
-if not raw:
-    print(3)
-    raise SystemExit(0)
-try:
-    x = float(raw)
-except Exception:
-    print(3)
-    raise SystemExit(0)
-
-if x >= 0:
-    # The CLI expects an integer; use floor() to avoid over-penalizing.
-    print(int(math.floor(x)))
-else:
-    print(-int(math.floor(-x)))
-PY
-)"
+          import os, math
+          raw = (os.getenv('PENALTY_RAW') or '').strip().replace(',', '.')
+          if not raw:
+              print(3)
+              raise SystemExit(0)
+          try:
+              x = float(raw)
+          except Exception:
+              print(3)
+              raise SystemExit(0)
+          
+          if x >= 0:
+              # The CLI expects an integer; use floor() to avoid over-penalizing.
+              print(int(math.floor(x)))
+          else:
+              print(-int(math.floor(-x)))
+          PY
+          )"
           echo "penalty_store(raw)=$PENALTY_RAW -> penalty_store(int)=$PENALTY_STORE"
 
           python -m brickovery.cli solve \
