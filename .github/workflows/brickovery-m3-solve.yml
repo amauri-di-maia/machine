@@ -76,131 +76,138 @@ jobs:
               except Exception:
                   return None
 
-          forced = (os.environ.get("INPUT_SNAPSHOT_ID") or "").strip()
-          norm = (os.environ.get("NORMALIZED_ITEMS") or "").strip()
 
-          if forced:
-              print(f"Using forced snapshot_id from input: {forced}")
-              Path("snapshot_id.txt").write_text(forced, encoding="utf-8")
-              return
-
-          # 1) Prefer latest m2.done in logs matching current normalized_items_path
-          best = None
-          best_ts = None
-
-          log_paths = glob.glob("data base/logs/run-*/slice-0.jsonl")
-          for lp in log_paths:
-              try:
-                  with open(lp, "r", encoding="utf-8") as f:
-                      for line in f:
-                          line = line.strip()
-                          if not line or not line.startswith("{"):
-                              continue
-                          try:
-                              ev = json.loads(line)
-                          except Exception:
-                              continue
-                          if ev.get("event") != "m2.done":
-                              continue
-                          if norm and ev.get("normalized_items_path") != norm:
-                              continue
-                          ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
-                          if ts is None:
-                              continue
-                          if best_ts is None or ts > best_ts:
-                              best_ts = ts
-                              best = ev
-              except FileNotFoundError:
-                  continue
-
-          if best and best.get("snapshot_id"):
-              sid = str(best["snapshot_id"])
-              print(f"Using snapshot_id from latest m2.done log (matched normalized_items): {sid}")
-              Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
-              return
-
-          # 2) Fallback: any latest m2.done event (even if input mismatch)
-          best = None
-          best_ts = None
-          for lp in log_paths:
-              try:
-                  with open(lp, "r", encoding="utf-8") as f:
-                      for line in f:
-                          line = line.strip()
-                          if not line or not line.startswith("{"):
-                              continue
-                          try:
-                              ev = json.loads(line)
-                          except Exception:
-                              continue
-                          if ev.get("event") != "m2.done":
-                              continue
-                          ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
-                          if ts is None:
-                              continue
-                          if best_ts is None or ts > best_ts:
-                              best_ts = ts
-                              best = ev
-              except FileNotFoundError:
-                  continue
-
-          if best and best.get("snapshot_id"):
-              sid = str(best["snapshot_id"])
-              print(f"Using snapshot_id from latest m2.done log (any): {sid}")
-              Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
-              return
-
-          # 3) Fallback: latest refresh_report.*.json (prefer match, then most recent)
-          best_path = None
-          best_ts = None
-          paths = glob.glob("outputs/market/refresh_report.*.json")
-          for p in paths:
-              try:
-                  report = json.load(open(p, "r", encoding="utf-8"))
-              except Exception:
-                  continue
-              if norm and report.get("normalized_items_path") != norm:
-                  continue
-              ts = parse_ts(report.get("created_ts"))
-              if ts is None:
-                  continue
-              if best_ts is None or ts > best_ts:
-                  best_ts = ts
-                  best_path = p
-          if not best_path and paths:
-              # no match; pick most recent by mtime
-              best_path = sorted(paths, key=lambda x: os.path.getmtime(x))[-1]
-
-          if best_path:
-              report = json.load(open(best_path, "r", encoding="utf-8"))
-              sid = str(report.get("snapshot_id") or "")
-              if sid:
-                  print(f"Using snapshot_id from refresh_report: {best_path}: {sid}")
+          def main():
+              forced = (os.environ.get("INPUT_SNAPSHOT_ID") or "").strip()
+              norm = (os.environ.get("NORMALIZED_ITEMS") or "").strip()
+              
+              if forced:
+                  print(f"Using forced snapshot_id from input: {forced}")
+                  Path("snapshot_id.txt").write_text(forced, encoding="utf-8")
+                  return
+              
+              # 1) Prefer latest m2.done in logs matching current normalized_items_path
+              best = None
+              best_ts = None
+              
+              log_paths = glob.glob("data base/logs/run-*/slice-0.jsonl")
+              for lp in log_paths:
+                  try:
+                      with open(lp, "r", encoding="utf-8") as f:
+                          for line in f:
+                              line = line.strip()
+                              if not line or not line.startswith("{"):
+                                  continue
+                              try:
+                                  ev = json.loads(line)
+                              except Exception:
+                                  continue
+                              if ev.get("event") != "m2.done":
+                                  continue
+                              if norm and ev.get("normalized_items_path") != norm:
+                                  continue
+                              ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
+                              if ts is None:
+                                  continue
+                              if best_ts is None or ts > best_ts:
+                                  best_ts = ts
+                                  best = ev
+                  except FileNotFoundError:
+                      continue
+              
+              if best and best.get("snapshot_id"):
+                  sid = str(best["snapshot_id"])
+                  print(f"Using snapshot_id from latest m2.done log (matched normalized_items): {sid}")
                   Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
                   return
+              
+              # 2) Fallback: any latest m2.done event (even if input mismatch)
+              best = None
+              best_ts = None
+              for lp in log_paths:
+                  try:
+                      with open(lp, "r", encoding="utf-8") as f:
+                          for line in f:
+                              line = line.strip()
+                              if not line or not line.startswith("{"):
+                                  continue
+                              try:
+                                  ev = json.loads(line)
+                              except Exception:
+                                  continue
+                              if ev.get("event") != "m2.done":
+                                  continue
+                              ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
+                              if ts is None:
+                                  continue
+                              if best_ts is None or ts > best_ts:
+                                  best_ts = ts
+                                  best = ev
+                  except FileNotFoundError:
+                      continue
+              
+              if best and best.get("snapshot_id"):
+                  sid = str(best["snapshot_id"])
+                  print(f"Using snapshot_id from latest m2.done log (any): {sid}")
+                  Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+                  return
+              
+              # 3) Fallback: latest refresh_report.*.json (prefer match, then most recent)
+              best_path = None
+              best_ts = None
+              paths = glob.glob("outputs/market/refresh_report.*.json")
+              for p in paths:
+                  try:
+                      report = json.load(open(p, "r", encoding="utf-8"))
+                  except Exception:
+                      continue
+                  if norm and report.get("normalized_items_path") != norm:
+                      continue
+                  ts = parse_ts(report.get("created_ts"))
+                  if ts is None:
+                      continue
+                  if best_ts is None or ts > best_ts:
+                      best_ts = ts
+                      best_path = p
+              if not best_path and paths:
+                  # no match; pick most recent by mtime
+                  best_path = sorted(paths, key=lambda x: os.path.getmtime(x))[-1]
+              
+              if best_path:
+                  report = json.load(open(best_path, "r", encoding="utf-8"))
+                  sid = str(report.get("snapshot_id") or "")
+                  if sid:
+                      print(f"Using snapshot_id from refresh_report: {best_path}: {sid}")
+                      Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+                      return
+              
+              # 4) Last resort: derive from DB (max snapshot_id present)
+              import sqlite3
+              db_path = "data base/brickovery.db"
+              if not os.path.exists(db_path):
+                  raise SystemExit("ERROR: could not resolve snapshot_id (no logs, no refresh_report, and DB missing)")
+              
+              con = sqlite3.connect(db_path)
+              cur = con.cursor()
+              sid = None
+              for table in ("market_offers","market_metrics"):
+                  try:
+                      row = cur.execute(f"SELECT MAX(snapshot_id) FROM {table}").fetchone()
+                      if row and row[0]:
+                          sid = str(row[0])
+                          break
+                  except Exception:
+                      pass
+              con.close()
+              if not sid:
+                  raise SystemExit("ERROR: could not resolve snapshot_id from DB")
+              print(f"Using snapshot_id from DB max(snapshot_id): {sid}")
+              Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
 
-          # 4) Last resort: derive from DB (max snapshot_id present)
-          import sqlite3
-          db_path = "data base/brickovery.db"
-          if not os.path.exists(db_path):
-              raise SystemExit("ERROR: could not resolve snapshot_id (no logs, no refresh_report, and DB missing)")
-
-          con = sqlite3.connect(db_path)
-          cur = con.cursor()
-          sid = None
-          for table in ("market_offers","market_metrics"):
-              try:
-                  row = cur.execute(f"SELECT MAX(snapshot_id) FROM {table}").fetchone()
-                  if row and row[0]:
-                      sid = str(row[0])
-                      break
-              except Exception:
-                  pass
-          con.close()
-          if not sid:
-              raise SystemExit("ERROR: could not resolve snapshot_id from DB")
-          print(f"Using snapshot_id from DB max(snapshot_id): {sid}")
-          Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+          if __name__ == '__main__':
+              import sys
+              ret = main()
+              sys.exit(0 if ret is None else int(ret))
           PY
 
           SNAPSHOT_ID="$(cat snapshot_id.txt)"
@@ -246,22 +253,18 @@ jobs:
           latest="$(ls -t outputs/solver/seed_solutions.*.json | head -n 1 || true)"
           echo "latest: ${latest}"
           if [ -n "${latest}" ]; then
-            export LATEST="${latest}"
-            python - <<'PY'
-          import json, os
-          p = os.environ["LATEST"]
-          with open(p, "r", encoding="utf-8") as f:
-              data = json.load(f)
-          print("run_id:", data.get("run_id"))
-          print("snapshot_id:", data.get("snapshot_id"))
-          print("normalized_items_path:", data.get("normalized_items_path"))
-          sc = data.get("scenarios") or []
-          print("scenarios:", len(sc))
-          for s in sc:
-              costs = s.get("costs") or {}
-              missing = s.get("missing_items") or []
-              print("-", s.get("scenario"), "score:", costs.get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(missing))
-          PY
+            python - <<PY
+import json
+p="${latest}"
+data=json.load(open(p,"r",encoding="utf-8"))
+print("run_id:", data.get("run_id"))
+print("snapshot_id:", data.get("snapshot_id"))
+print("normalized_items_path:", data.get("normalized_items_path"))
+sc=data.get("scenarios") or []
+print("scenarios:", len(sc))
+for s in sc:
+    print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or []))
+PY
           fi
 
       - name: Upload solver artifacts
