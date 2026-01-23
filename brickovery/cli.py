@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from __future__ import annotations
+
+import argparse
 import glob
 import json
 import os
@@ -1154,8 +1157,9 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 return False
 
         refreshed = 0
-        skipped = 0
+        cache_hits = 0  # TTL hit: refresh skipped (item still fully participates downstream)
         errors = 0
+        per_item = []  # audit trail
 
         for it in items:
             itype = it["bl_itemtype"]
@@ -1172,9 +1176,37 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                     continue
             cid = int(cid)
 
-            if not args.force and _fresh(_last_ts(itype, pid, cid, "N")) and _fresh(_last_ts(itype, pid, cid, "U")):
-                skipped += 1
+            last_n = _last_ts(itype, pid, cid, "N")
+            last_u = _last_ts(itype, pid, cid, "U")
+            fresh_n = _fresh(last_n)
+            fresh_u = _fresh(last_u)
+
+            if not args.force and fresh_n and fresh_u:
+                cache_hits += 1
+                per_item.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": cid,
+                    "decision": "cache_hit",
+                    "reason": "ttl_fresh_both_conditions",
+                    "last_fetched_ts_N": last_n,
+                    "last_fetched_ts_U": last_u,
+                    "ttl_hours": ttl_hours,
+                })
+                logger.log("m2.item.cache_hit", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, ttl_hours=ttl_hours, last_fetched_ts_N=last_n, last_fetched_ts_U=last_u)
                 continue
+
+            per_item.append({
+                "bl_itemtype": itype,
+                "bl_part_id": pid,
+                "bl_color_id": cid,
+                "decision": "refresh",
+                "reason": "force" if args.force else "ttl_stale_or_missing",
+                "last_fetched_ts_N": last_n,
+                "last_fetched_ts_U": last_u,
+                "ttl_hours": ttl_hours,
+            })
+            logger.log("m2.item.refresh", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, force=bool(args.force), ttl_hours=ttl_hours, last_fetched_ts_N=last_n, last_fetched_ts_U=last_u)
 
             try:
                 html_cat = _fetch(session, url_catalog, params={itype.upper(): pid}, headers=headers, timeout_s=args.timeout_s, max_tries=args.max_tries, delay_s=0.0)
@@ -1253,6 +1285,13 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 refreshed += 1
             except Exception as e:
                 errors += 1
+                per_item.append({
+                    "bl_itemtype": itype,
+                    "bl_part_id": pid,
+                    "bl_color_id": cid,
+                    "decision": "error",
+                    "error": str(e),
+                })
                 logger.log("m2.error", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, error=str(e))
 
         con.commit()
@@ -1267,7 +1306,8 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "created_ts": fetched_ts,
             "ttl_hours": ttl_hours,
             "refreshed_items": refreshed,
-            "skipped_items": skipped,
+            "cache_hits": cache_hits,
+            "skipped_items": cache_hits,  # backward-compat alias; means TTL cache hit (not "skipping items")
             "errors": errors,
             "normalized_items_path": norm_path,
             "cookie_env_var": args.cookie_env_var,
@@ -1275,6 +1315,7 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "data_source": data_source,
         }
         _write_json(str(out_dir / f"refresh_report.{run_id}.json"), report)
+        _write_json(str(out_dir / f"refresh_items.{run_id}.json"), {"items": per_item})
         logger.log("m2.done", **report)
 
         return 0
