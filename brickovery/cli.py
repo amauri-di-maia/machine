@@ -506,7 +506,7 @@ def _record_pending_upsert(
     payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     _ensure_pending_upserts_table(con)
-    now = _utc_now()
+    now = _iso_now()
     color = int(it.bl_color_id) if it.bl_color_id is not None else 0
     con.execute(
         """
