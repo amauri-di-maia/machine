@@ -3,32 +3,18 @@ name: Brickovery - M3 Solve Seeds
 on:
   workflow_dispatch:
     inputs:
-      time_budget_minutes:
-        description: "Solver time budget (minutes)"
-        required: false
-        default: "20"
-      checkpoint_every_seconds:
-        description: "Checkpoint interval (seconds)"
-        required: false
-        default: "120"
-      penalty_store:
-        description: "Penalty per store (EUR)"
-        required: false
-        default: "2.50"
       mode:
-        description: "Mode: normal"
-        required: false
-        default: "normal"
-
-concurrency:
-  group: brickovery-m3
-  cancel-in-progress: false
+        description: "Shipping mode to score (normal|registered|both)"
+        required: true
+        default: "both"
 
 jobs:
   solve:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -36,117 +22,74 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (minimal)
+      - name: Install deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install pydantic PyYAML beautifulsoup4 requests
+          pip install PyYAML pydantic beautifulsoup4 requests
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
 
-      - name: Normalize input (M1 inside M3)
+      - name: Set RUN_ID
+        run: |
+          set -euo pipefail
+          echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
+
+      - name: Normalize input (M1)
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          mkdir -p outputs/inputs
-          python -m brickovery.cli normalize-input \
-            --config configs/config.v1.yaml \
-            --input inputs/search.xml \
-            --output-dir outputs/inputs
+          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --input inputs/search.xml             --output-dir outputs/inputs
 
-      - name: Resolve snapshot_id (must match normalized_items SHA)
+      - name: Resolve latest normalized_items + snapshot_id from DB
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import glob, json, hashlib, os, sys
-          from datetime import datetime
+          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json | head -n 1)"
+          echo "LATEST_NORM=$latest_norm" >> $GITHUB_ENV
+          echo "latest_norm=$latest_norm"
 
-          # 1) pick latest normalized_items file produced in this run
-          norm_paths = sorted(glob.glob("outputs/inputs/normalized_items.*.json"))
-          if not norm_paths:
-            print("ERROR: no outputs/inputs/normalized_items.*.json found (normalize-input failed?)")
-            sys.exit(1)
+          # Pick most-recent snapshot present in DB (M2 already populated offers/metrics)
+          snap="$(sqlite3 "data base/brickovery.db" "
+            SELECT snapshot_id
+            FROM (
+              SELECT snapshot_id, fetched_ts FROM market_offers
+              UNION ALL
+              SELECT snapshot_id, fetched_ts FROM market_metrics
+            )
+            ORDER BY fetched_ts DESC, snapshot_id DESC
+            LIMIT 1;
+          ")"
 
-          norm_path = norm_paths[-1]
-          with open(norm_path, "rb") as f:
-            norm_bytes = f.read()
-          norm_sha = hashlib.sha256(norm_bytes).hexdigest()
-          print(f"normalized_items_path={norm_path}")
-          print(f"normalized_items_sha256={norm_sha}")
+          if [ -z "$snap" ]; then
+            echo "ERROR: Could not resolve snapshot_id from DB (market_offers/market_metrics empty)."
+            echo "Action: Run M2 refresh-cache (force once after changing search.xml) then re-run M3."
+            exit 1
+          fi
 
-          # 2) scan refresh reports and pick latest one that matches this sha
-          rr_paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
-          if not rr_paths:
-            print("ERROR: no outputs/market/refresh_report.*.json found.")
-            print("You must run M2 refresh-cache (preferably once with --force after changing search.xml) before M3.")
-            sys.exit(1)
+          offers="$(sqlite3 "data base/brickovery.db" "SELECT COUNT(*) FROM market_offers WHERE snapshot_id='$snap';")"
+          metrics="$(sqlite3 "data base/brickovery.db" "SELECT COUNT(*) FROM market_metrics WHERE snapshot_id='$snap';")"
+          echo "SNAPSHOT_ID=$snap" >> $GITHUB_ENV
+          echo "snapshot_id=$snap offers_rows=$offers metrics_rows=$metrics"
 
-          candidates = []
-          for p in rr_paths:
-            try:
-              with open(p, "r", encoding="utf-8") as f:
-                r = json.load(f)
-            except Exception:
-              continue
-            if (r.get("normalized_items_sha256") or "").strip().lower() == norm_sha.lower():
-              # choose by created_ts if present, else by filename
-              created = r.get("created_ts") or r.get("ts") or ""
-              candidates.append((created, p, r))
+          if [ "$offers" -eq 0 ] && [ "$metrics" -eq 0 ]; then
+            echo "ERROR: snapshot_id resolved but has 0 rows in both market_offers and market_metrics."
+            echo "Action: Re-run M2 refresh-cache (with --force once) and ensure it writes to the same DB."
+            exit 1
+          fi
 
-          if not candidates:
-            # give diagnostics
-            print("ERROR: no refresh_report matches the normalized_items produced in this run.")
-            print("This usually means you changed inputs/search.xml but did not run M2 for the new set of items.")
-            print("Action: Run M2 refresh-cache with --force once, then run M3 again.")
-            print("Available refresh reports (last 5):")
-            for p in rr_paths[-5:]:
-              try:
-                with open(p, "r", encoding="utf-8") as f:
-                  r = json.load(f)
-                print(f"- {p} snapshot_id={r.get('snapshot_id')} norm_sha={r.get('normalized_items_sha256')}")
-              except Exception:
-                print(f"- {p} (unreadable)")
-            sys.exit(1)
-
-          # sort candidates by created_ts then path
-          def parse_dt(s: str):
-            try:
-              return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-              return datetime.min
-
-          candidates.sort(key=lambda t: (parse_dt(t[0]), t[1]))
-          created, best_path, best = candidates[-1]
-          snapshot_id = best.get("snapshot_id") or best.get("run_id") or ""
-          if not snapshot_id:
-            print(f"ERROR: matched refresh report but no snapshot_id/run_id inside: {best_path}")
-            sys.exit(1)
-
-          print(f"Using refresh_report={best_path}")
-          print(f"Using snapshot_id={snapshot_id}")
-          # export to GitHub env
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-            f.write(f"SNAPSHOT_ID={snapshot_id}\n")
-            f.write(f"NORMALIZED_ITEMS_SHA256={norm_sha}\n")
-            f.write(f"NORMALIZED_ITEMS_PATH={norm_path}\n")
-          PY
-
-      - name: Solve (M3)
+      - name: Run M3 solve (seed scenarios)
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          mkdir -p outputs/solve/checkpoints
-          python -m brickovery.cli solve \
-            --config configs/config.v1.yaml \
-            --snapshot-id "${SNAPSHOT_ID}" \
-            --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}" \
-            --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}" \
-            --penalty-store "${{ github.event.inputs.penalty_store }}" \
-            --mode "${{ github.event.inputs.mode }}" \
-            --output outputs/solve/seed_solutions.${{ github.run_id }}.json
+          python -m brickovery.cli solve             --config configs/config.v1.yaml             --normalized-items "$LATEST_NORM"             --snapshot-id "$SNAPSHOT_ID"             --mode "${{ inputs.mode }}"
 
-      - name: Upload solve outputs
+      - name: Upload artifacts (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: brickovery-m3-outputs-${{ github.run_id }}
+          name: brickovery-m3-artifacts-${{ env.RUN_ID }}
           path: |
-            outputs/solve/**
             outputs/inputs/**
+            outputs/solve/**
+            outputs/market/**
+            data base/logs/**
