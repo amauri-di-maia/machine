@@ -38,6 +38,29 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Preflight - verify inputs/search.xml (and commit is fresh)
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          echo "Repo HEAD: $(git rev-parse HEAD)"
+          echo "Last commit: $(git log -1 --oneline)"
+          echo "Listing inputs/:"
+          ls -la inputs || true
+          if [ ! -f inputs/search.xml ]; then
+            echo "::error::inputs/search.xml not found. Commit it under inputs/search.xml (same branch as the workflow run)."
+            exit 1
+          fi
+          python - <<'PY'
+          import re, hashlib, pathlib
+          p = pathlib.Path('inputs/search.xml')
+          txt = p.read_text(encoding='utf-8', errors='ignore').lstrip('\ufeff')
+          b = txt.encode('utf-8', errors='ignore')
+          print('search.xml bytes:', len(b))
+          print('search.xml sha256:', hashlib.sha256(b).hexdigest())
+          print('<ITEM> tag count:', len(re.findall(r'<\\s*ITEM\\b', txt, flags=re.I)))
+          ids = re.findall(r'<\\s*ITEMID\\s*>\\s*([^<\\s]+)\\s*<\\s*/\\s*ITEMID\\s*>', txt, flags=re.I)
+          print('ITEMID sample:', ids[:10])
+          PY
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -428,4 +451,3 @@ jobs:
           path: |
             repo/outputs/**
             repo/data base/logs/**
-            
