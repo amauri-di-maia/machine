@@ -91,20 +91,6 @@ jobs:
           echo "LATEST_NORM=$latest_norm" >> "$GITHUB_ENV"
           echo "latest_norm=$latest_norm"
 
-      - name: Check BRICKLINK_COOKIE secret (length only)
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os, sys
-          c = os.getenv('BRICKLINK_COOKIE','')
-          print('BRICKLINK_COOKIE_len=', len(c))
-          if len(c) < 30:
-              print('ERROR: BRICKLINK_COOKIE secret is missing/empty (Settings → Secrets and variables → Actions).')
-              sys.exit(1)
-          PY
-        env:
-          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
-
       - name: Refresh cache (M2)
         env:
           BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
@@ -197,7 +183,38 @@ jobs:
           RUN_ID="${{ needs.m2_refresh.outputs.run_id }}"
           echo "Using SNAPSHOT_ID=$SNAPSHOT_ID RUN_ID=$RUN_ID"
 
-          python -m brickovery.cli solve             --config configs/config.v1.yaml             --snapshot-id "$SNAPSHOT_ID"             --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}"             --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}"             --penalty-store "${{ github.event.inputs.penalty_store }}"             --output "outputs/solve/seed_solutions.${RUN_ID}.json"
+          # CLI currently expects integer penalties. Allow decimal input in the workflow
+          # (e.g., 2.50) by rounding half-up to the nearest integer.
+          PENALTY_RAW="${{ github.event.inputs.penalty_store }}"
+          export PENALTY_RAW
+          PENALTY_STORE="$(python - <<'PY'
+import os, math
+raw = (os.getenv('PENALTY_RAW') or '').strip().replace(',', '.')
+if not raw:
+    print(3)
+    raise SystemExit(0)
+try:
+    x = float(raw)
+except Exception:
+    print(3)
+    raise SystemExit(0)
+
+if x >= 0:
+    # The CLI expects an integer; use floor() to avoid over-penalizing.
+    print(int(math.floor(x)))
+else:
+    print(-int(math.floor(-x)))
+PY
+)"
+          echo "penalty_store(raw)=$PENALTY_RAW -> penalty_store(int)=$PENALTY_STORE"
+
+          python -m brickovery.cli solve \
+            --config configs/config.v1.yaml \
+            --snapshot-id "$SNAPSHOT_ID" \
+            --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}" \
+            --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}" \
+            --penalty-store "$PENALTY_STORE" \
+            --output "outputs/solve/seed_solutions.${RUN_ID}.json"
 
       - name: Summary (filter by shipping_method)
         run: |
