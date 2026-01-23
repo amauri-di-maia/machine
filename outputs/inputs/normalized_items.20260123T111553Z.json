@@ -1,0 +1,502 @@
+[
+  {
+    "bl_itemtype": "B",
+    "bl_part_id": "6079399",
+    "bl_color_id": 0,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "M",
+    "bl_part_id": "cty0472",
+    "bl_color_id": 0,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "11187",
+    "bl_color_id": 110,
+    "qty": 2,
+    "condition": "U",
+    "boid": "391240-43",
+    "weight_mg": 210,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "14518",
+    "bl_color_id": 85,
+    "qty": 3,
+    "condition": "U",
+    "boid": "945407-50",
+    "weight_mg": 6800,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "14520",
+    "bl_color_id": 1,
+    "qty": 30,
+    "condition": "U",
+    "boid": "788434-92",
+    "weight_mg": 1700,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "14520",
+    "bl_color_id": 3,
+    "qty": 3,
+    "condition": "U",
+    "boid": "788434-93",
+    "weight_mg": 1700,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "14520",
+    "bl_color_id": 5,
+    "qty": 13,
+    "condition": "U",
+    "boid": "788434-81",
+    "weight_mg": 1700,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "14520",
+    "bl_color_id": 85,
+    "qty": 70,
+    "condition": "U",
+    "boid": "788434-50",
+    "weight_mg": 1700,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15065pb01",
+    "bl_color_id": 55,
+    "qty": 1,
+    "condition": "U",
+    "boid": "225266-85",
+    "weight_mg": 1040,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15209",
+    "bl_color_id": 1,
+    "qty": 16,
+    "condition": "U",
+    "boid": "936134-92",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15209",
+    "bl_color_id": 2,
+    "qty": 8,
+    "condition": "U",
+    "boid": "936134-89",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15209",
+    "bl_color_id": 5,
+    "qty": 1,
+    "condition": "U",
+    "boid": "936134-81",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15209",
+    "bl_color_id": 11,
+    "qty": 7,
+    "condition": "U",
+    "boid": "936134-38",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15209",
+    "bl_color_id": 158,
+    "qty": 16,
+    "condition": "U",
+    "boid": "936134-94",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15475pb01",
+    "bl_color_id": 77,
+    "qty": 1,
+    "condition": "U",
+    "boid": "606221-119",
+    "weight_mg": 1090,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15500",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": "994973-38",
+    "weight_mg": 570,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15501",
+    "bl_color_id": 68,
+    "qty": 2,
+    "condition": "U",
+    "boid": "310321-54",
+    "weight_mg": 120,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15623pb001",
+    "bl_color_id": 86,
+    "qty": 1,
+    "condition": "U",
+    "boid": "193831-64",
+    "weight_mg": 47650,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15624",
+    "bl_color_id": 34,
+    "qty": 14,
+    "condition": "U",
+    "boid": "10270-70",
+    "weight_mg": 12000,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15624",
+    "bl_color_id": 85,
+    "qty": 12,
+    "condition": "U",
+    "boid": "10270-50",
+    "weight_mg": 12000,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15625",
+    "bl_color_id": 85,
+    "qty": 1,
+    "condition": "U",
+    "boid": "411793-50",
+    "weight_mg": 5150,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15625",
+    "bl_color_id": 86,
+    "qty": 6,
+    "condition": "U",
+    "boid": "411793-64",
+    "weight_mg": 5150,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15851pb01",
+    "bl_color_id": 11,
+    "qty": 2,
+    "condition": "U",
+    "boid": "329339-38",
+    "weight_mg": 570,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15976",
+    "bl_color_id": 1,
+    "qty": 7,
+    "condition": "U",
+    "boid": "738065-92",
+    "weight_mg": 3600,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15976",
+    "bl_color_id": 5,
+    "qty": 2,
+    "condition": "U",
+    "boid": "738065-81",
+    "weight_mg": 3600,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15976",
+    "bl_color_id": 11,
+    "qty": 67,
+    "condition": "U",
+    "boid": "738065-38",
+    "weight_mg": 3600,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15976",
+    "bl_color_id": 48,
+    "qty": 7,
+    "condition": "U",
+    "boid": "738065-18",
+    "weight_mg": 3600,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "15976",
+    "bl_color_id": 95,
+    "qty": 14,
+    "condition": "U",
+    "boid": "738065-117",
+    "weight_mg": 3600,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "16178pb01",
+    "bl_color_id": 5,
+    "qty": 3,
+    "condition": "U",
+    "boid": "914572-81",
+    "weight_mg": 730,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "17114",
+    "bl_color_id": 11,
+    "qty": 14,
+    "condition": "U",
+    "boid": "28223-38",
+    "weight_mg": 2340,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "17114",
+    "bl_color_id": 85,
+    "qty": 2,
+    "condition": "U",
+    "boid": "28223-50",
+    "weight_mg": 2340,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "17114",
+    "bl_color_id": 120,
+    "qty": 7,
+    "condition": "U",
+    "boid": "28223-51",
+    "weight_mg": 2340,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "2446pb38",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": "837578-38",
+    "weight_mg": 460,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "3039pb075",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "3622pb051R",
+    "bl_color_id": 6,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "4150pb152",
+    "bl_color_id": 86,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "4150pb157",
+    "bl_color_id": 104,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "4150pb158",
+    "bl_color_id": 4,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "41879pb001",
+    "bl_color_id": 153,
+    "qty": 1,
+    "condition": "U",
+    "boid": "942057-47",
+    "weight_mg": 930,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "45677pb073",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "47753pb047",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": "56298-38",
+    "weight_mg": 2100,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "50950pb066",
+    "bl_color_id": 34,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "60603pb003",
+    "bl_color_id": 15,
+    "qty": 1,
+    "condition": "U",
+    "boid": "543977-101",
+    "weight_mg": 1230,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "87079pb0167",
+    "bl_color_id": 7,
+    "qty": 1,
+    "condition": "U",
+    "boid": "86645-39",
+    "weight_mg": 900,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "90639pb021",
+    "bl_color_id": 95,
+    "qty": 1,
+    "condition": "U",
+    "boid": "892159-117",
+    "weight_mg": 2900,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "90639pb022",
+    "bl_color_id": 95,
+    "qty": 2,
+    "condition": "U",
+    "boid": "165963-117",
+    "weight_mg": 2900,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "90639pb023",
+    "bl_color_id": 95,
+    "qty": 1,
+    "condition": "U",
+    "boid": "72820-117",
+    "weight_mg": 2900,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "90639pb024",
+    "bl_color_id": 95,
+    "qty": 1,
+    "condition": "U",
+    "boid": "664463-117",
+    "weight_mg": 2900,
+    "mapping_source": "upstream"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "93606pb018",
+    "bl_color_id": 11,
+    "qty": 1,
+    "condition": "U",
+    "boid": null,
+    "weight_mg": null,
+    "mapping_source": "missing"
+  },
+  {
+    "bl_itemtype": "P",
+    "bl_part_id": "98138pb019",
+    "bl_color_id": 50,
+    "qty": 3,
+    "condition": "U",
+    "boid": "675028-99",
+    "weight_mg": 110,
+    "mapping_source": "upstream"
+  }
+]
