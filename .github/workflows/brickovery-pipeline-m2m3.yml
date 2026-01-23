@@ -208,13 +208,51 @@ jobs:
           )"
           echo "penalty_store(raw)=$PENALTY_RAW -> penalty_store(int)=$PENALTY_STORE"
 
-          python -m brickovery.cli solve \
-            --config configs/config.v1.yaml \
-            --snapshot-id "$SNAPSHOT_ID" \
-            --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}" \
-            --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}" \
-            --penalty-store "$PENALTY_STORE" \
-            --output "outputs/solve/seed_solutions.${RUN_ID}.json"
+          # Build solve args from CLI help so we never pass unsupported flags
+          HELP="$(python -m brickovery.cli solve -h 2>&1 || true)"
+          echo "== brickovery solve -h (first 120 lines) =="
+          echo "$HELP" | sed -n '1,120p'
+
+          SOLVE_ARGS=(--config configs/config.v1.yaml --snapshot-id "$SNAPSHOT_ID" --run-id "$RUN_ID" --slice-id "0" --penalty-store "$PENALTY_STORE")
+
+          # output flag (current CLI uses --output-dir; older variants used --output)
+          if echo "$HELP" | grep -q -- '--output-dir'; then
+            SOLVE_ARGS+=(--output-dir "outputs/solve")
+          elif echo "$HELP" | grep -q -- '--output'; then
+            SOLVE_ARGS+=(--output "outputs/solve/seed_solutions.${RUN_ID}.json")
+          else
+            echo "ERROR: could not find an output flag in solve help"; exit 1
+          fi
+
+          # Optional flags: only append if supported by this CLI version
+          if echo "$HELP" | grep -q -- '--scenarios'; then
+            SOLVE_ARGS+=(--scenarios "${{ github.event.inputs.scenarios }}")
+          else
+            echo "NOTE: CLI does not support --scenarios; using built-in defaults."
+          fi
+
+          if echo "$HELP" | grep -q -- '--shipping-method'; then
+            SOLVE_ARGS+=(--shipping-method "${{ github.event.inputs.shipping_method }}")
+          fi
+
+          if echo "$HELP" | grep -q -- '--mode'; then
+            SOLVE_ARGS+=(--mode "${{ github.event.inputs.mode }}")
+          fi
+
+          if echo "$HELP" | grep -q -- '--time-budget-minutes'; then
+            SOLVE_ARGS+=(--time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}")
+          else
+            echo "NOTE: CLI does not support --time-budget-minutes; ignoring input."
+          fi
+
+          if echo "$HELP" | grep -q -- '--checkpoint-every-seconds'; then
+            SOLVE_ARGS+=(--checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}")
+          else
+            echo "NOTE: CLI does not support --checkpoint-every-seconds; ignoring input."
+          fi
+
+          echo "Running: python -m brickovery.cli solve ${SOLVE_ARGS[*]}"
+          python -m brickovery.cli solve "${SOLVE_ARGS[@]}"
 
       - name: Summary (filter by shipping_method)
         run: |
