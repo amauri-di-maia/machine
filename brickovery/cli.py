@@ -306,7 +306,7 @@ def _parse_search_xml(path: str) -> List[_RawItem]:
         if qty <= 0:
             return None
 
-        color_id: Optional[int] = None
+        color_id: int = 0
         if color_raw:
             try:
                 color_id = int(float(color_raw))
@@ -1065,8 +1065,8 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             pid = it["bl_part_id"]
             cid = it.get("bl_color_id")
             if cid is None:
-                skipped += 1
-                continue
+                # BrickLink uses COLOR=0 when colour is not applicable. Do not skip items.
+                cid = 0
             cid = int(cid)
 
             if not args.force and _fresh(_last_ts(itype, pid, cid, "N")) and _fresh(_last_ts(itype, pid, cid, "U")):
