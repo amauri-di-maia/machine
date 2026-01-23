@@ -1,0 +1,257 @@
+name: Brickovery - Pipeline (M2 refresh + M3 solve)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Force refresh (ignores TTL) for this run"
+        required: false
+        default: "true"
+      ttl_hours:
+        description: "TTL hours for current_offers (M2)"
+        required: false
+        default: "6"
+      time_budget_minutes:
+        description: "Solver time budget (minutes)"
+        required: false
+        default: "20"
+      checkpoint_every_seconds:
+        description: "Checkpoint interval (seconds)"
+        required: false
+        default: "120"
+      penalty_store:
+        description: "Penalty per store (EUR)"
+        required: false
+        default: "2.50"
+      shipping_method:
+        description: "Shipping method to SHOW in summary (normal / registered / both). Does not change solve."
+        required: false
+        default: "both"
+      persist_to_repo:
+        description: "Commit & push DB/outputs back to repo at end"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: brickovery-pipeline
+  cancel-in-progress: false
+
+jobs:
+  m2_refresh:
+    name: "M2 — Normalize + Refresh cache"
+    runs-on: ubuntu-latest
+    outputs:
+      snapshot_id: ${{ steps.read_snapshot.outputs.snapshot_id }}
+      run_id: ${{ steps.set_run_id.outputs.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (minimal)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pydantic PyYAML beautifulsoup4 requests
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Set RUN_ID
+        id: set_run_id
+        run: |
+          set -euo pipefail
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Verify inputs exist
+        run: |
+          set -euo pipefail
+          ls -la inputs || true
+          test -f inputs/search.xml
+
+      - name: Normalize input (M1)
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          mkdir -p outputs/inputs
+          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --input inputs/search.xml             --output-dir outputs/inputs
+
+      - name: Locate latest normalized_items
+        run: |
+          set -euo pipefail
+          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json | head -n 1)"
+          echo "LATEST_NORM=$latest_norm" >> "$GITHUB_ENV"
+          echo "latest_norm=$latest_norm"
+
+      - name: Check BRICKLINK_COOKIE secret (length only)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          c = os.getenv('BRICKLINK_COOKIE','')
+          print('BRICKLINK_COOKIE_len=', len(c))
+          if len(c) < 30:
+              print('ERROR: BRICKLINK_COOKIE secret is missing/empty (Settings → Secrets and variables → Actions).')
+              sys.exit(1)
+          PY
+        env:
+          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
+
+      - name: Refresh cache (M2)
+        env:
+          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+
+          force="${{ github.event.inputs.force_refresh }}"
+          ttl="${{ github.event.inputs.ttl_hours }}"
+
+          echo "RUN_ID=$RUN_ID"
+          echo "LATEST_NORM=$LATEST_NORM"
+          echo "force_refresh=$force ttl_hours=$ttl"
+
+          extra=""
+          if [ "$force" = "true" ]; then
+            extra="--force"
+          fi
+
+          # NOTE: intentionally no --output-dir here (CLI may not support it).
+          python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --normalized-items "$LATEST_NORM"             --ttl-hours "$ttl"             $extra
+
+      - name: Read snapshot_id from latest refresh_report
+        id: read_snapshot
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, json, os, sys
+          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not paths:
+              print("ERROR: No outputs/market/refresh_report.*.json found (refresh-cache did not write report)")
+              sys.exit(1)
+          rp = paths[-1]
+          with open(rp, "r", encoding="utf-8") as f:
+              report = json.load(f)
+          snapshot_id = report.get("snapshot_id") or report.get("run_id")
+          if not snapshot_id:
+              print(f"ERROR: refresh_report missing snapshot_id/run_id: {rp}")
+              sys.exit(1)
+          print(f"refresh_report={rp}")
+          print(f"snapshot_id={snapshot_id}")
+          # expose to next job
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"snapshot_id={snapshot_id}\n")
+          PY
+
+      - name: Upload M2 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m2-${{ github.run_id }}
+          path: |
+            outputs/inputs/**
+            outputs/market/**
+            data base/brickovery.db
+            data base/logs/**
+
+  m3_solve:
+    name: "M3 — Solve using the same snapshot from M2"
+    runs-on: ubuntu-latest
+    needs: [m2_refresh]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download M2 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: brickovery-m2-${{ github.run_id }}
+          path: .
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (minimal)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pydantic PyYAML beautifulsoup4 requests
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Solve (M3)
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          mkdir -p outputs/solve/checkpoints
+          SNAPSHOT_ID="${{ needs.m2_refresh.outputs.snapshot_id }}"
+          RUN_ID="${{ needs.m2_refresh.outputs.run_id }}"
+          echo "Using SNAPSHOT_ID=$SNAPSHOT_ID RUN_ID=$RUN_ID"
+
+          python -m brickovery.cli solve             --config configs/config.v1.yaml             --snapshot-id "$SNAPSHOT_ID"             --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}"             --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}"             --penalty-store "${{ github.event.inputs.penalty_store }}"             --output "outputs/solve/seed_solutions.${RUN_ID}.json"
+
+      - name: Summary (filter by shipping_method)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, json, os, sys
+          ship = (os.getenv("SHIP_METHOD") or "${{ github.event.inputs.shipping_method }}").strip().lower()
+          paths = sorted(glob.glob("outputs/solve/seed_solutions.*.json"))
+          if not paths:
+              print("No seed_solutions found.")
+              sys.exit(0)
+          p = paths[-1]
+          with open(p, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          scenarios = data.get("scenarios") or data.get("solutions") or []
+          def keep(s):
+              name = (s.get("name") or s.get("scenario") or "").lower()
+              if ship == "both":
+                  return True
+              if ship == "normal":
+                  return "normal" in name and "registered" not in name
+              if ship == "registered":
+                  return "registered" in name
+              return True
+          kept = [s for s in scenarios if keep(s)]
+          print(f"seed_file={p}")
+          print(f"shipping_method={ship}")
+          for s in kept:
+              print(f"- {s.get('name') or s.get('scenario')} score={s.get('score')} stores={s.get('stores_used') or s.get('stores')} missing={s.get('missing_items') or s.get('missing')}")
+          PY
+
+      - name: Upload M3 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: brickovery-m3-${{ github.run_id }}
+          path: |
+            outputs/solve/**
+            outputs/inputs/**
+            outputs/market/**
+            data base/brickovery.db
+            data base/logs/**
+
+      - name: Persist to repo (optional)
+        if: ${{ github.event.inputs.persist_to_repo == 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "data base/brickovery.db" "outputs/inputs" "outputs/market" "outputs/solve" || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          SNAPSHOT_ID="${{ needs.m2_refresh.outputs.snapshot_id }}"
+          RUN_ID="${{ needs.m2_refresh.outputs.run_id }}"
+          git commit -m "Brickovery pipeline run_id=${RUN_ID} snapshot=${SNAPSHOT_ID}"
+          git push
