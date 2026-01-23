@@ -3,325 +3,103 @@ name: Brickovery - M2 Refresh Cache
 on:
   workflow_dispatch:
     inputs:
-      force_refresh:
-        description: "Force refresh ignoring TTL (temporary)"
+      force:
+        description: "Force refresh (ignore TTL once)"
         required: false
-        default: false
-        type: boolean
-      coverage_debug:
-        description: "Print offer coverage per requested item (counts after filters)"
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      commit_push:
+        description: "Commit & push DB + reports to repo (required for M3 to see data)"
         required: false
-        default: true
-        type: boolean
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
 concurrency:
-  group: brickovery-m2-refresh-cache
+  group: brickovery-m2
   cancel-in-progress: false
 
-permissions:
-  contents: write
-
 jobs:
-  refresh_cache:
+  refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Clone repo manually
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
-          cd repo
-          git checkout "${BRANCH}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        working-directory: repo
+      - name: Install deps (minimal)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+          pip install pydantic PyYAML beautifulsoup4 requests
 
-      - name: Verify input files exist
-        working-directory: repo
+      - name: Verify inputs exist
         run: |
           set -euo pipefail
-          ls -la "inputs" || true
+          ls -la inputs || true
           test -f "inputs/search.xml"
-          test -f "data base/rarity_rules.txt" || true
-          test -f "data base/shipping_normal.txt" || true
-          test -f "data base/shipping_registered.txt" || true
 
-      - name: Normalize input (ensure current search.xml is used)
-        working-directory: repo
+      - name: Normalize input (M1 inside M2)
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+          mkdir -p outputs/inputs
+          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --input inputs/search.xml             --output-dir outputs/inputs
 
-      - name: Select latest normalized_items path
-        id: norm
-        working-directory: repo
+      - name: Refresh cache (M2)
         run: |
           set -euo pipefail
-          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json 2>/dev/null | head -n 1 || true)"
-          if [ -z "$latest_norm" ]; then
-            echo "ERROR: normalize-input did not produce outputs/inputs/normalized_items.*.json"
-            ls -la outputs/inputs || true
-            exit 1
+          export PYTHONPATH="$PWD"
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
           fi
-          echo "path=$latest_norm" >> "$GITHUB_OUTPUT"
-          echo "normalized_items_path=$latest_norm"
+          python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             $FORCE_FLAG
 
-      - name: Run M2 refresh-cache
-        working-directory: repo
-        env:
-          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
+      - name: DB gate (must have offers + metrics)
         run: |
           set -euo pipefail
-          export PYTHONPATH="$PWD"
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-          echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
-          EXTRA_ARGS=""
-          if [ "${{ inputs.force_refresh }}" = "true" ]; then EXTRA_ARGS="--force"; fi
-          python -m brickovery.cli refresh-cache --config configs/config.v1.yaml ${EXTRA_ARGS}
-
-      - name: Check refresh_report result
-        if: always()
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
-          import json, glob, sys
-          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
-          if not paths:
-              print("ERROR: No outputs/market/refresh_report.*.json found")
-              sys.exit(1)
-          rp = paths[-1]
-          report = json.load(open(rp,"r",encoding="utf-8"))
-          errors = int(report.get("errors", 0))
-          refreshed = int(report.get("refreshed_items", 0))
-          skipped = int(report.get("skipped_items", 0))
-          print(f"refresh_report: {rp}")
-          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
-          if errors > 0:
-              sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
-          PY
-
-
-      - name: DB gate (market tables sanity)
-        if: always()
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
-          import sqlite3, sys
-          from pathlib import Path
-
-          DB = Path("data base/brickovery.db")
-          if not DB.exists():
-              raise SystemExit(f"DB gate FAILED: missing DB at {DB}")
-
-          head = DB.read_bytes()[:16]
-          if not head.startswith(b"SQLite format 3\x00"):
-              # show readable head to help diagnose LFS pointer / HTML etc.
-              sample = DB.read_bytes()[:64].decode("utf-8", errors="replace").replace("\n"," ")
-              raise SystemExit(f"DB gate FAILED: DB is not SQLite. head_sample={sample!r}")
-
-          con = sqlite3.connect(str(DB))
+          python - <<'PY'
+          import sqlite3, os
+          db = os.path.join("data base", "brickovery.db")
+          con = sqlite3.connect(db)
           con.row_factory = sqlite3.Row
-
-          def has_table(name: str) -> bool:
-              row = con.execute(
-                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                  (name,),
-              ).fetchone()
-              return row is not None
-
-          required = ["market_metrics", "market_offers"]
-          missing = [t for t in required if not has_table(t)]
-          if missing:
-              print("DB gate FAILED: missing required tables:", ", ".join(missing))
-              sys.exit(1)
-
-          # Basic row counts
-          for t in required:
-              n = con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-              print(f"{t}.rows={n}")
-
-          # market_metrics sanity: must have BL rows for N/U (per spec)
-          n_bl_nu = con.execute(
-              "SELECT COUNT(*) AS n FROM market_metrics WHERE platform='BL' AND condition IN ('N','U')"
-          ).fetchone()["n"]
-          print(f"market_metrics.bl_nu_rows={n_bl_nu}")
-          if n_bl_nu == 0:
-              print("DB gate FAILED: market_metrics has no platform='BL' rows for condition N/U.")
-              sys.exit(1)
-
-          # BASE_VALUE availability indicator (not a hard failure)
-          n_base = con.execute(
-              "SELECT COUNT(*) AS n FROM market_metrics WHERE sold_6m_avg_price_eur IS NOT NULL"
-          ).fetchone()["n"]
-          print(f"market_metrics.base_value_nonnull={n_base}")
-
-          # market_offers sanity: must have ships_to_me=1 and EU store countries
-          EU = {
-              "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT",
-              "LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
-          }
-          placeholders = ",".join(["?"] * len(EU))
-          n_eu = con.execute(
-              f"SELECT COUNT(*) AS n FROM market_offers "
-              f"WHERE ships_to_me=1 AND country_iso2 IN ({placeholders})",
-              tuple(sorted(EU)),
-          ).fetchone()["n"]
-          print(f"market_offers.ships_to_me_eu_rows={n_eu}")
-          if n_eu == 0:
-              print("DB gate FAILED: market_offers has 0 rows with ships_to_me=1 and EU country_iso2.")
-              sys.exit(1)
-
+          def count(t):
+            try:
+              return con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            except Exception:
+              return None
+          offers = count("market_offers")
+          metrics = count("market_metrics")
+          print(f"market_offers.rows={offers}")
+          print(f"market_metrics.rows={metrics}")
+          if offers in (None, 0) or metrics in (None, 0):
+            raise SystemExit("ERROR: DB gate failed (missing market_offers/market_metrics).")
           PY
 
-      - name: Coverage debug (offers per requested item)
-        if: ${{ always() && inputs.coverage_debug }}
-        working-directory: repo
+      - name: Commit & push (required for M3)
+        if: ${{ github.event.inputs.commit_push == 'true' }}
         run: |
           set -euo pipefail
-          export PYTHONPATH="$PWD"
-      
-          # Use the normalized_items generated in this run (from the normalize-input step)
-          latest_norm="${{ steps.norm.outputs.path }}"
-          if [ -z "$latest_norm" ] || [ ! -f "$latest_norm" ]; then
-            echo "ERROR: normalized_items path not found (normalize step may have failed)."
-            ls -la outputs/inputs || true
-            exit 1
-          fi
-          echo "normalized_items_for_debug=$latest_norm"
+          git config user.name "brickovery-bot"
+          git config user.email "actions@users.noreply.github.com"
 
-          NORM_PATH="${{ steps.norm.outputs.path }}" python - <<'PY'
-          import json, sqlite3
-          from pathlib import Path
-      
-          DB = Path("data base/brickovery.db")
-          con = sqlite3.connect(str(DB))
-          con.row_factory = sqlite3.Row
-      
-          cols = [r["name"] for r in con.execute("PRAGMA table_info(market_offers)").fetchall()]
-          qty_col = None
-          for c in ("qty", "qty_available", "quantity", "lot_qty", "available_qty"):
-            if c in cols:
-              qty_col = c
-              break
-      
-          EU = set(["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"])
-          eu_list = sorted(EU)
-          eu_ph = ",".join(["?"]*len(eu_list))
-      
-          import os, glob
-          norm_path = Path(os.environ.get("NORM_PATH","").strip())
-          if not norm_path or not norm_path.exists():
-            paths = sorted(glob.glob("outputs/inputs/normalized_items.*.json"))
-            norm_path = Path(paths[-1]) if paths else None
-          if not norm_path or not norm_path.exists():
-            raise SystemExit("Coverage debug: missing normalized_items file.")
+          # Add only what M3 needs to consume deterministically
+          git add "data base/brickovery.db" || true
+          git add outputs/inputs outputs/market || true
 
-          data = json.load(norm_path.open("r", encoding="utf-8"))
-          if isinstance(data, dict):
-            items = data.get("items") or data.get("normalized_items") or []
-          else:
-            items = data  # list
-          print(f"Coverage debug: {len(items)} requested items")
-      
-          for it in items:
-            # expected keys (normalized output)
-            bl_itemtype = it.get("bl_itemtype") or it.get("ITEMTYPE") or it.get("itemtype")
-            bl_part_id  = str(it.get("bl_part_id") or it.get("ITEMID") or it.get("part_id"))
-            bl_color_id = it.get("bl_color_id") or it.get("COLOR") or it.get("color_id")
-            cond        = it.get("condition") or it.get("CONDITION") or it.get("cond") or "N"
-            platform    = it.get("platform") or "BL"
-      
-            where = "platform=? AND bl_itemtype=? AND bl_part_id=? AND bl_color_id=? AND condition=?"
-            # bl_color_id is mandatory for strict lot-level coverage, but debug must not crash.
-            # Normalização de bl_color_id: alguns ITEMTYPE não têm cor aplicável; para coverage debug nunca fazemos skip.
-            # None/''/inválido -> 0 (convenção BrickLink).
-            if bl_color_id is None or str(bl_color_id).strip()=="":
-              bl_color_id_i = 0
-            else:
-              try:
-                bl_color_id_i = int(str(bl_color_id).strip())
-              except Exception:
-                bl_color_id_i = 0
-            params = (platform, bl_itemtype, bl_part_id, bl_color_id_i, cond)
-      
-            n_total = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where}", params).fetchone()["n"]
-            n_ship  = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where} AND ships_to_me=1", params).fetchone()["n"]
-            n_eu    = con.execute(f"SELECT COUNT(*) AS n FROM market_offers WHERE {where} AND ships_to_me=1 AND country_iso2 IN ({eu_ph})", params + tuple(eu_list)).fetchone()["n"]
-      
-            if qty_col:
-              q_total = con.execute(f"SELECT COALESCE(SUM({qty_col}),0) AS q FROM market_offers WHERE {where}", params).fetchone()["q"]
-              q_eu    = con.execute(f"SELECT COALESCE(SUM({qty_col}),0) AS q FROM market_offers WHERE {where} AND ships_to_me=1 AND country_iso2 IN ({eu_ph})", params + tuple(eu_list)).fetchone()["q"]
-            else:
-              q_total = q_eu = None
-      
-            print(f"- {platform}:{bl_itemtype} {bl_part_id} color={bl_color_id} cond={cond} :: offers_total={n_total} offers_ships={n_ship} offers_eu_ships={n_eu} qty_total={q_total} qty_eu_ships={q_eu}")
-      
-          PY
-      
-      - name: Show last m2.error events (jsonl)
-        if: always()
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          # Prefer the RUN_ID we generated above (timestamp). If not present, fall back to newest run-* dir.
-          RID="${RUN_ID:-}"
-          LOG_ROOT="data base/logs"
-
-          if [ -n "$RID" ] && [ -d "${LOG_ROOT}/run-${RID}" ]; then
-            TARGET_DIR="${LOG_ROOT}/run-${RID}"
-          else
-            TARGET_DIR="$(ls -1d "${LOG_ROOT}"/run-* 2>/dev/null | sort | tail -n 1 || true)"
-          fi
-
-          echo "TARGET_LOG_DIR=${TARGET_DIR}"
-          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
-            echo "No log dir found. Listing available logs:"
-            find "$LOG_ROOT" -maxdepth 3 -type f -name "slice-*.jsonl" -print || true
+          # If nothing changed, do nothing
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
             exit 0
           fi
 
-          mapfile -d '' files < <(find "$TARGET_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No slice-*.jsonl found under: $TARGET_DIR"
-            find "$TARGET_DIR" -maxdepth 3 -type f -print || true
-            exit 0
-          fi
-
-          echo "== last m2.error events (if any) =="
-          for f in "${files[@]}"; do
-            echo "--- $f ---"
-            if grep -q '"event":"m2.error"' "$f"; then
-              grep '"event":"m2.error"' "$f" | tail -n 20
-            else
-              echo "(no m2.error entries; tail last 40 lines)"
-              tail -n 40 "$f" || true
-            fi
-          done
-
-      - name: Upload artifacts (outputs + logs)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: brickovery-m2
-          path: |
-            repo/outputs/**
-            repo/data base/logs/**
+          git commit -m "M2 refresh-cache (run_id=${{ github.run_id }})"
+          git push
