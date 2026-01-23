@@ -467,6 +467,77 @@ def _ensure_fill_later(con, item: _RawItem, reason: str) -> None:
     )
 
 
+
+def _ensure_pending_upserts_table(con: sqlite3.Connection) -> None:
+    """Local queue of upstream fixes required for missing/partial mapping rows.
+
+    This does NOT push anything upstream by default. It only records what must be
+    resolved (boid/weight/missing row), so we can later run a controlled stage
+    that uses APIs and creates an upstream commit/PR.
+    """
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS upstream_pending_upserts (
+            bl_itemtype TEXT NOT NULL,
+            bl_part_id  TEXT NOT NULL,
+            bl_color_id INTEGER NOT NULL DEFAULT 0,
+            needs_boid  INTEGER NOT NULL DEFAULT 0,
+            needs_weight INTEGER NOT NULL DEFAULT 0,
+            status      TEXT NOT NULL,
+            reason      TEXT,
+            payload_json TEXT,
+            created_ts  TEXT NOT NULL,
+            updated_ts  TEXT NOT NULL,
+            PRIMARY KEY (bl_itemtype, bl_part_id, bl_color_id)
+        );
+        """
+    )
+    con.commit()
+
+
+def _record_pending_upsert(
+    con: sqlite3.Connection,
+    it: SearchItem,
+    *,
+    needs_boid: bool,
+    needs_weight: bool,
+    status: str,
+    reason: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    _ensure_pending_upserts_table(con)
+    now = _utc_now()
+    color = int(it.bl_color_id) if it.bl_color_id is not None else 0
+    con.execute(
+        """
+        INSERT INTO upstream_pending_upserts
+            (bl_itemtype, bl_part_id, bl_color_id, needs_boid, needs_weight, status, reason, payload_json, created_ts, updated_ts)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(bl_itemtype, bl_part_id, bl_color_id)
+        DO UPDATE SET
+            needs_boid=excluded.needs_boid,
+            needs_weight=excluded.needs_weight,
+            status=excluded.status,
+            reason=excluded.reason,
+            payload_json=excluded.payload_json,
+            updated_ts=excluded.updated_ts;
+        """,
+        (
+            it.bl_itemtype,
+            it.bl_part_id,
+            color,
+            1 if needs_boid else 0,
+            1 if needs_weight else 0,
+            status,
+            reason,
+            json.dumps(payload or {}, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    con.commit()
+
 def cmd_normalize_input(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     run_id = args.run_id or make_run_id()
@@ -516,6 +587,19 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                 total_weight_mg += weight_mg * it.qty
             else:
                 stats["missing_weight"] += 1
+            # Record upstream fix requirements (controlled stage later).
+            # This must NOT block the pipeline; we only queue the need for enrichment/upsert.
+            if boid is None or weight_mg is None:
+                _record_pending_upsert(
+                    con,
+                    it,
+                    needs_boid=(boid is None),
+                    needs_weight=(weight_mg is None),
+                    status="pending",
+                    reason=f"needs upstream enrichment (source={source})",
+                    payload={"source": source},
+                )
+
 
             normalized.append(
                 {
