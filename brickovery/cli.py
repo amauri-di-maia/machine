@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-import argparse
-from __future__ import annotations
 
 import argparse
 import glob
