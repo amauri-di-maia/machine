@@ -62,6 +62,21 @@ jobs:
           test -f "data base/shipping_normal.txt" || true
           test -f "data base/shipping_registered.txt" || true
 
+      - name: Generate RUN_ID
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "RUN_ID=$RUN_ID"
+
+      - name: Sanity check Python entrypoint
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m py_compile brickovery/cli.py
+          python -m compileall -q brickovery
+
       - name: Normalize input (ensure current search.xml is used)
         working-directory: repo
         run: |
@@ -90,8 +105,12 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-          echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
+          # Use RUN_ID generated earlier for consistent log + snapshot IDs.
+          if [ -z "${RUN_ID:-}" ]; then
+            RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+            echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          fi
+          echo "RUN_ID=$RUN_ID"
           EXTRA_ARGS=""
           if [ "${{ inputs.force_refresh }}" = "true" ]; then EXTRA_ARGS="--force"; fi
           python -m brickovery.cli refresh-cache --config configs/config.v1.yaml ${EXTRA_ARGS}
@@ -282,27 +301,49 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          # Prefer the RUN_ID we generated above (timestamp). If not present, fall back to newest run-* dir.
+
           RID="${RUN_ID:-}"
           LOG_ROOT="data base/logs"
+          PREFERRED=""
+          TARGET_DIR=""
 
-          if [ -n "$RID" ] && [ -d "${LOG_ROOT}/run-${RID}" ]; then
-            TARGET_DIR="${LOG_ROOT}/run-${RID}"
-          else
-            TARGET_DIR="$(ls -1d "${LOG_ROOT}"/run-* 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$RID" ] && [ -d "$LOG_ROOT/run-$RID" ]; then
+            PREFERRED="$LOG_ROOT/run-$RID"
+          fi
+
+          if [ -n "$PREFERRED" ]; then
+            if find "$PREFERRED" -type f -name "slice-*.jsonl" -print -quit | grep -q .; then
+              TARGET_DIR="$PREFERRED"
+            else
+              echo "Preferred log dir exists but has no slice-*.jsonl: $PREFERRED"
+              echo "Listing preferred dir:"
+              find "$PREFERRED" -maxdepth 3 -type f -print || true
+            fi
+          fi
+
+          if [ -z "$TARGET_DIR" ]; then
+            # Pick newest run-* directory that contains at least one slice file
+            TARGET_DIR="$(for d in "$LOG_ROOT"/run-*; do
+              [ -d "$d" ] || continue
+              if find "$d" -type f -name "slice-*.jsonl" -print -quit | grep -q .; then
+                echo "$d"
+              fi
+            done | sort | tail -n 1 || true)"
           fi
 
           echo "TARGET_LOG_DIR=${TARGET_DIR}"
           if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
-            echo "No log dir found. Listing available logs:"
-            find "$LOG_ROOT" -maxdepth 3 -type f -name "slice-*.jsonl" -print || true
+            echo "No usable log dir found under: $LOG_ROOT"
+            echo "Listing any slice files that exist:"
+            find "$LOG_ROOT" -maxdepth 4 -type f -name "slice-*.jsonl" -print || true
             exit 0
           fi
 
           mapfile -d '' files < <(find "$TARGET_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No slice-*.jsonl found under: $TARGET_DIR"
-            find "$TARGET_DIR" -maxdepth 3 -type f -print || true
+            echo "Listing any slice files that exist under LOG_ROOT:"
+            find "$LOG_ROOT" -maxdepth 4 -type f -name "slice-*.jsonl" -print || true
             exit 0
           fi
 
