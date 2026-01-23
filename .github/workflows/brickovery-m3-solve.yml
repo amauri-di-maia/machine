@@ -1,16 +1,8 @@
-name: Brickovery - Pipeline (M2 refresh + M3 solve)
+name: Brickovery - M3 Solve Seeds
 
 on:
   workflow_dispatch:
     inputs:
-      force_refresh:
-        description: "Force refresh (ignores TTL) for this run"
-        required: false
-        default: "true"
-      ttl_hours:
-        description: "TTL hours for current_offers (M2)"
-        required: false
-        default: "6"
       time_budget_minutes:
         description: "Solver time budget (minutes)"
         required: false
@@ -23,32 +15,31 @@ on:
         description: "Penalty per store (EUR)"
         required: false
         default: "2.50"
+      mode:
+        description: "Mode (normal only for now)"
+        required: false
+        default: "normal"
+        type: choice
+        options: ["normal"]
       shipping_method:
-        description: "Shipping method to SHOW in summary (normal / registered / both). Does not change solve."
+        description: "Filter summary by shipping method"
         required: false
         default: "both"
-      persist_to_repo:
-        description: "Commit & push DB/outputs back to repo at end"
-        required: false
-        default: "false"
-
-permissions:
-  contents: write
+        type: choice
+        options: ["both", "normal", "registered"]
 
 concurrency:
-  group: brickovery-pipeline
+  group: brickovery-m3
   cancel-in-progress: false
 
 jobs:
-  m2_refresh:
-    name: "M2 — Normalize + Refresh cache"
+  solve:
     runs-on: ubuntu-latest
-    outputs:
-      snapshot_id: ${{ steps.read_snapshot.outputs.snapshot_id }}
-      run_id: ${{ steps.set_run_id.outputs.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -60,215 +51,124 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install pydantic PyYAML beautifulsoup4 requests
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
 
-      - name: Set RUN_ID
-        id: set_run_id
-        run: |
-          set -euo pipefail
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-
-      - name: Verify inputs exist
-        run: |
-          set -euo pipefail
-          ls -la inputs || true
-          test -f inputs/search.xml
-
-      - name: Normalize input (M1)
-        run: |
-          set -euo pipefail
-          export PYTHONPATH="$PWD"
-          mkdir -p outputs/inputs
-          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --input inputs/search.xml             --output-dir outputs/inputs
-
-      - name: Locate latest normalized_items
-        run: |
-          set -euo pipefail
-          latest_norm="$(ls -1t outputs/inputs/normalized_items.*.json | head -n 1)"
-          echo "LATEST_NORM=$latest_norm" >> "$GITHUB_ENV"
-          echo "latest_norm=$latest_norm"
-
-      - name: Refresh cache (M2)
-        env:
-          BRICKLINK_COOKIE: ${{ secrets.BRICKLINK_COOKIE }}
-        run: |
-          set -euo pipefail
-          export PYTHONPATH="$PWD"
-
-          force="${{ github.event.inputs.force_refresh }}"
-          ttl="${{ github.event.inputs.ttl_hours }}"
-
-          echo "RUN_ID=$RUN_ID"
-          echo "LATEST_NORM=$LATEST_NORM"
-          echo "force_refresh=$force ttl_hours=$ttl"
-
-          extra=""
-          if [ "$force" = "true" ]; then
-            extra="--force"
-          fi
-
-          # NOTE: intentionally no --output-dir here (CLI may not support it).
-          python -m brickovery.cli refresh-cache             --config configs/config.v1.yaml             --normalized-items "$LATEST_NORM"             --ttl-hours "$ttl"             $extra
-
-      - name: Read snapshot_id from latest refresh_report
-        id: read_snapshot
+      - name: Resolve snapshot_id from latest refresh_report (authoritative)
         run: |
           set -euo pipefail
           python - <<'PY'
           import glob, json, os, sys
-          paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
-          if not paths:
-              print("ERROR: No outputs/market/refresh_report.*.json found (refresh-cache did not write report)")
-              sys.exit(1)
-          rp = paths[-1]
-          with open(rp, "r", encoding="utf-8") as f:
-              report = json.load(f)
+          from datetime import datetime
+
+          rr_paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not rr_paths:
+            print("ERROR: No outputs/market/refresh_report.*.json found in repo.")
+            print("Action: run M2 refresh-cache with commit_push=true (so reports are committed), then rerun M3.")
+            sys.exit(1)
+
+          def parse_dt(p):
+            try:
+              r = json.load(open(p,"r",encoding="utf-8"))
+            except Exception:
+              return (datetime.min, None)
+            ts = r.get("created_ts") or r.get("ts") or ""
+            try:
+              dt = datetime.fromisoformat(ts.replace("Z","+00:00"))
+            except Exception:
+              dt = datetime.min
+            return (dt, r)
+
+          best = None
+          for p in rr_paths:
+            dt, r = parse_dt(p)
+            if r is None: 
+              continue
+            if best is None or (dt, p) > (best[0], best[1]):
+              best = (dt, p, r)
+
+          if best is None:
+            print("ERROR: Could not parse any refresh_report.*.json")
+            sys.exit(1)
+
+          _, best_path, report = best
           snapshot_id = report.get("snapshot_id") or report.get("run_id")
           if not snapshot_id:
-              print(f"ERROR: refresh_report missing snapshot_id/run_id: {rp}")
-              sys.exit(1)
-          print(f"refresh_report={rp}")
-          print(f"snapshot_id={snapshot_id}")
-          # expose to next job
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write(f"snapshot_id={snapshot_id}\n")
+            print(f"ERROR: refresh_report has no snapshot_id/run_id: {best_path}")
+            sys.exit(1)
+
+          norm_path = report.get("normalized_items_path") or ""
+          print(f"Using refresh_report={best_path}")
+          print(f"Using snapshot_id={snapshot_id}")
+          if norm_path:
+            print(f"Report normalized_items_path={norm_path}")
+
+          # Export to env for next steps
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+            f.write(f"SNAPSHOT_ID={snapshot_id}\n")
+            f.write(f"REFRESH_REPORT_PATH={best_path}\n")
+            if norm_path:
+              f.write(f"NORMALIZED_ITEMS_PATH={norm_path}\n")
           PY
 
-      - name: Upload M2 artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: brickovery-m2-${{ github.run_id }}
-          path: |
-            outputs/inputs/**
-            outputs/market/**
-            data base/brickovery.db
-            data base/logs/**
-
-  m3_solve:
-    name: "M3 — Solve using the same snapshot from M2"
-    runs-on: ubuntu-latest
-    needs: [m2_refresh]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download M2 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: brickovery-m2-${{ github.run_id }}
-          path: .
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps (minimal)
+      - name: DB gate (confirm M2 data is present in repo DB)
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install pydantic PyYAML beautifulsoup4 requests
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+          python - <<'PY'
+          import sqlite3, os
+          db = os.path.join("data base","brickovery.db")
+          con = sqlite3.connect(db)
+          con.row_factory = sqlite3.Row
+          def count(t):
+            try:
+              return con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            except Exception:
+              return None
+          offers = count("market_offers")
+          metrics = count("market_metrics")
+          print(f"market_offers.rows={offers}")
+          print(f"market_metrics.rows={metrics}")
+          if offers in (None, 0) or metrics in (None, 0):
+            raise SystemExit("ERROR: DB gate failed. This usually means M2 did not commit/push DB changes to the repo.")
+          PY
 
       - name: Solve (M3)
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
           mkdir -p outputs/solve/checkpoints
-          SNAPSHOT_ID="${{ needs.m2_refresh.outputs.snapshot_id }}"
-          RUN_ID="${{ needs.m2_refresh.outputs.run_id }}"
-          echo "Using SNAPSHOT_ID=$SNAPSHOT_ID RUN_ID=$RUN_ID"
+          python -m brickovery.cli solve             --config configs/config.v1.yaml             --snapshot-id "${SNAPSHOT_ID}"             --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}"             --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}"             --penalty-store "${{ github.event.inputs.penalty_store }}"             --mode "${{ github.event.inputs.mode }}"             --output outputs/solve/seed_solutions.${{ github.run_id }}.json
 
-          # CLI currently expects integer penalties. Allow decimal input in the workflow
-          # (e.g., 2.50) by rounding half-up to the nearest integer.
-          PENALTY_RAW="${{ github.event.inputs.penalty_store }}"
-          export PENALTY_RAW
-          PENALTY_STORE="$(python - <<'PY'
-import os, math
-raw = (os.getenv('PENALTY_RAW') or '').strip().replace(',', '.')
-if not raw:
-    print(3)
-    raise SystemExit(0)
-try:
-    x = float(raw)
-except Exception:
-    print(3)
-    raise SystemExit(0)
-
-if x >= 0:
-    # The CLI expects an integer; use floor() to avoid over-penalizing.
-    print(int(math.floor(x)))
-else:
-    print(-int(math.floor(-x)))
-PY
-)"
-          echo "penalty_store(raw)=$PENALTY_RAW -> penalty_store(int)=$PENALTY_STORE"
-
-          python -m brickovery.cli solve \
-            --config configs/config.v1.yaml \
-            --snapshot-id "$SNAPSHOT_ID" \
-            --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}" \
-            --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}" \
-            --penalty-store "$PENALTY_STORE" \
-            --output "outputs/solve/seed_solutions.${RUN_ID}.json"
-
-      - name: Summary (filter by shipping_method)
+      - name: Show summary (filter by shipping method)
         run: |
           set -euo pipefail
           python - <<'PY'
           import glob, json, os, sys
-          ship = (os.getenv("SHIP_METHOD") or "${{ github.event.inputs.shipping_method }}").strip().lower()
+          ship = os.environ.get("SHIP_FILTER","both")
           paths = sorted(glob.glob("outputs/solve/seed_solutions.*.json"))
           if not paths:
-              print("No seed_solutions found.")
-              sys.exit(0)
-          p = paths[-1]
-          with open(p, "r", encoding="utf-8") as f:
-              data = json.load(f)
-          scenarios = data.get("scenarios") or data.get("solutions") or []
+            print("No seed_solutions.*.json found")
+            sys.exit(0)
+          data = json.load(open(paths[-1],"r",encoding="utf-8"))
+          print(f"run_id: {data.get('run_id')}")
+          print(f"snapshot_id: {data.get('snapshot_id')}")
+          print(f"normalized_items_path: {data.get('normalized_items_path')}")
+          scenarios = data.get("scenarios", [])
           def keep(s):
-              name = (s.get("name") or s.get("scenario") or "").lower()
-              if ship == "both":
-                  return True
-              if ship == "normal":
-                  return "normal" in name and "registered" not in name
-              if ship == "registered":
-                  return "registered" in name
-              return True
+            if ship == "both": return True
+            name = (s.get("name") or "").lower()
+            return ship in name
           kept = [s for s in scenarios if keep(s)]
-          print(f"seed_file={p}")
-          print(f"shipping_method={ship}")
+          print(f"scenarios_total: {len(scenarios)} kept: {len(kept)} ship_filter={ship}")
           for s in kept:
-              print(f"- {s.get('name') or s.get('scenario')} score={s.get('score')} stores={s.get('stores_used') or s.get('stores')} missing={s.get('missing_items') or s.get('missing')}")
+            print(f"- {s.get('name')} score: {s.get('score_total')} stores: {s.get('n_stores_used')} missing: {len(s.get('missing_items',[]))}")
           PY
+        env:
+          SHIP_FILTER: ${{ github.event.inputs.shipping_method }}
 
-      - name: Upload M3 artifacts
+      - name: Upload solve outputs
         uses: actions/upload-artifact@v4
         with:
-          name: brickovery-m3-${{ github.run_id }}
+          name: brickovery-m3-outputs-${{ github.run_id }}
           path: |
             outputs/solve/**
-            outputs/inputs/**
             outputs/market/**
-            data base/brickovery.db
-            data base/logs/**
-
-      - name: Persist to repo (optional)
-        if: ${{ github.event.inputs.persist_to_repo == 'true' }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "data base/brickovery.db" "outputs/inputs" "outputs/market" "outputs/solve" || true
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          SNAPSHOT_ID="${{ needs.m2_refresh.outputs.snapshot_id }}"
-          RUN_ID="${{ needs.m2_refresh.outputs.run_id }}"
-          git commit -m "Brickovery pipeline run_id=${RUN_ID} snapshot=${SNAPSHOT_ID}"
-          git push
+            outputs/inputs/**
