@@ -138,6 +138,64 @@ jobs:
           PY
 
 
+
+
+      - name: Compute pinned snapshot_id (avoid empty snapshots on TTL hits)
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, glob, os
+
+          paths = sorted(glob.glob('outputs/market/refresh_report.*.json'))
+          if not paths:
+              raise SystemExit('No outputs/market/refresh_report.*.json found')
+
+          def snap(r):
+              return r.get('effective_snapshot_id') or r.get('snapshot_id') or r.get('run_id') or ''
+
+          latest = paths[-1]
+          rep = json.load(open(latest, 'r', encoding='utf-8'))
+          latest_snap = snap(rep)
+          refreshed = int(rep.get('refreshed_items', 0))
+          errors = int(rep.get('errors', 0))
+
+          pinned = latest_snap
+          if errors == 0 and refreshed == 0:
+              for pp in reversed(paths[:-1]):
+                  r = json.load(open(pp, 'r', encoding='utf-8'))
+                  if int(r.get('errors', 0)) == 0 and int(r.get('refreshed_items', 0)) > 0:
+                      pinned = snap(r)
+                      break
+
+          os.makedirs('outputs/market', exist_ok=True)
+          meta = {
+              'latest_report': latest,
+              'latest_snapshot_id': latest_snap,
+              'pinned_snapshot_id': pinned,
+              'latest_refreshed_items': int(rep.get('refreshed_items', 0)),
+              'latest_skipped_items': int(rep.get('skipped_items', 0)),
+              'latest_errors': int(rep.get('errors', 0)),
+          }
+
+          with open('outputs/market/pinned_snapshot.json', 'w', encoding='utf-8') as f:
+              json.dump(meta, f, indent=2)
+              f.write('\n')
+          with open('outputs/market/pinned_snapshot_id.txt', 'w', encoding='utf-8') as f:
+              f.write(pinned + '\n')
+
+          # Export for later steps
+          env_path = os.environ.get('GITHUB_ENV')
+          if env_path:
+              with open(env_path, 'a', encoding='utf-8') as f:
+                  f.write(f"M2_SNAPSHOT_ID={latest_snap}\n")
+                  f.write(f"PINNED_SNAPSHOT_ID={pinned}\n")
+
+          print('Pinned snapshot computed:')
+          print(meta)
+          PY
+
       - name: DB gate (market tables sanity)
         if: always()
         working-directory: repo
@@ -302,7 +360,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          RID="${RUN_ID:-}"
+          # Prefer the snapshot_id from the latest refresh_report, because the CLI may generate its own run_id.
+          RID="$(ls -1t outputs/market/refresh_report.*.json 2>/dev/null | head -n 1 | xargs -r jq -r '.snapshot_id // .run_id // empty' || true)"
+          if [ -z "$RID" ]; then RID="${RUN_ID:-}"; fi
           LOG_ROOT="data base/logs"
           PREFERRED=""
           TARGET_DIR=""
