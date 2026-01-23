@@ -1,141 +1,263 @@
-name: Brickovery - M3 Solve Seeds
+name: Brickovery - M3 Solve (snapshot pinned)
 
 on:
   workflow_dispatch:
     inputs:
       snapshot_id:
-        description: "Optional snapshot_id to solve against (defaults to latest in DB)"
+        description: "Optional: force snapshot_id (otherwise auto-resolve latest matching current normalized_items)"
         required: false
-        type: string
-      normalized_items:
-        description: "Optional path to normalized_items.*.json (defaults to latest in outputs/inputs)"
+        default: ""
+      scenarios:
+        description: "Number of scenarios to output"
         required: false
-        type: string
+        default: "5"
 
 concurrency:
-  group: brickovery-m3-main
+  group: brickovery-m3-solve
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   solve:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Clone repo manually
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
-          cd repo
-          git checkout "${BRANCH}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        working-directory: repo
+      - name: Install runtime deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            # fallback (keep minimal)
-            pip install PyYAML pydantic beautifulsoup4 typing-extensions
-          fi
-
-      - name: Install sqlite3
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+          pip install PyYAML pydantic requests beautifulsoup4
 
       - name: Verify inputs exist
-        working-directory: repo
         run: |
           set -euo pipefail
-          ls -la outputs/inputs || true
-          test -f configs/config.v1.yaml
-          # normalized items may be provided via workflow inputs; otherwise CLI will pick latest
-          if [ -n "${{ inputs.normalized_items }}" ]; then
-            test -f "${{ inputs.normalized_items }}"
-          fi
+          ls -la inputs || true
+          test -f inputs/search.xml
 
-      - name: Resolve snapshot_id (default = latest refresh_report / DB)
-        id: snap
-        working-directory: repo
-        env:
-          SNAP_IN: ${{ inputs.snapshot_id }}
+      - name: Normalize input -> outputs/inputs
+        id: norm
         run: |
-          set -euo pipefail
-
-          if [ -n "${SNAP_IN}" ]; then
-            echo "snapshot_id=${SNAP_IN}" >> "$GITHUB_OUTPUT"
-            echo "Using snapshot_id from workflow input: ${SNAP_IN}"
-            exit 0
-          fi
-
-          rp="$(ls -1t outputs/market/refresh_report.*.json 2>/dev/null | head -n 1 || true)"
-          if [ -n "${rp}" ]; then
-            sid="$(python -c "import json,sys; d=json.load(open(sys.argv[1],'r',encoding='utf-8')); print((d.get('snapshot_id') or d.get('run_id') or '').strip())" "${rp}")"
-            if [ -n "${sid}" ]; then
-              echo "snapshot_id=${sid}" >> "$GITHUB_OUTPUT"
-              echo "Using snapshot_id from ${rp}: ${sid}"
-              exit 0
-            fi
-          fi
-
-          if [ -f "data base/brickovery.db" ]; then
-            sid="$(sqlite3 "data base/brickovery.db" "SELECT snapshot_id FROM market_snapshots ORDER BY created_ts DESC LIMIT 1;" 2>/dev/null || true)"
-            sid="$(echo "${sid}" | tr -d '\r' | tr -d '\n')"
-            if [ -n "${sid}" ]; then
-              echo "snapshot_id=${sid}" >> "$GITHUB_OUTPUT"
-              echo "Using snapshot_id from DB market_snapshots: ${sid}"
-              exit 0
-            fi
-          fi
-
-          echo "snapshot_id=" >> "$GITHUB_OUTPUT"
-          echo "No snapshot_id resolved; solver will rely on internal defaults."
-
-      - name: M3 solve seeds
-        working-directory: repo
-        env:
-          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
-          NORMALIZED_ITEMS: ${{ inputs.normalized_items }}
-        run: |
-          SNAPSHOT_ID="${{ steps.snap.outputs.snapshot_id }}"
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          ARGS=()
-          if [ -n "${SNAPSHOT_ID}" ]; then
-            ARGS+=(--snapshot-id "${SNAPSHOT_ID}")
-          fi
-          if [ -n "${NORMALIZED_ITEMS}" ]; then
-            ARGS+=(--normalized-items "${NORMALIZED_ITEMS}")
-          fi
-          python -m brickovery.cli solve --config configs/config.v1.yaml --output-dir outputs/solver "${ARGS[@]}"
+          mkdir -p outputs/inputs
+          python -m brickovery.cli normalize-input --config configs/config.v1.yaml --input inputs/search.xml --output-dir outputs/inputs
+          latest_norm="$(ls -t outputs/inputs/normalized_items.*.json | head -n 1)"
+          echo "Latest normalized_items: ${latest_norm}"
+          echo "normalized_items=${latest_norm}" >> "$GITHUB_OUTPUT"
+          echo "NORMALIZED_ITEMS=${latest_norm}" >> "$GITHUB_ENV"
+
+      - name: Resolve snapshot_id (prefer matching normalized_items)
+        id: snap
+        env:
+          INPUT_SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id }}
+          NORMALIZED_ITEMS: ${{ steps.norm.outputs.normalized_items }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, glob, json, datetime
+          from pathlib import Path
+
+          def parse_ts(s: str):
+              if not s:
+                  return None
+              # accepts "2026-01-22T12:58:32Z"
+              try:
+                  return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+              except Exception:
+                  return None
+
+          forced = (os.environ.get("INPUT_SNAPSHOT_ID") or "").strip()
+          norm = (os.environ.get("NORMALIZED_ITEMS") or "").strip()
+
+          if forced:
+              print(f"Using forced snapshot_id from input: {forced}")
+              Path("snapshot_id.txt").write_text(forced, encoding="utf-8")
+              return
+
+          # 1) Prefer latest m2.done in logs matching current normalized_items_path
+          best = None
+          best_ts = None
+
+          log_paths = glob.glob("data base/logs/run-*/slice-0.jsonl")
+          for lp in log_paths:
+              try:
+                  with open(lp, "r", encoding="utf-8") as f:
+                      for line in f:
+                          line = line.strip()
+                          if not line or not line.startswith("{"):
+                              continue
+                          try:
+                              ev = json.loads(line)
+                          except Exception:
+                              continue
+                          if ev.get("event") != "m2.done":
+                              continue
+                          if norm and ev.get("normalized_items_path") != norm:
+                              continue
+                          ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
+                          if ts is None:
+                              continue
+                          if best_ts is None or ts > best_ts:
+                              best_ts = ts
+                              best = ev
+              except FileNotFoundError:
+                  continue
+
+          if best and best.get("snapshot_id"):
+              sid = str(best["snapshot_id"])
+              print(f"Using snapshot_id from latest m2.done log (matched normalized_items): {sid}")
+              Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+              return
+
+          # 2) Fallback: any latest m2.done event (even if input mismatch)
+          best = None
+          best_ts = None
+          for lp in log_paths:
+              try:
+                  with open(lp, "r", encoding="utf-8") as f:
+                      for line in f:
+                          line = line.strip()
+                          if not line or not line.startswith("{"):
+                              continue
+                          try:
+                              ev = json.loads(line)
+                          except Exception:
+                              continue
+                          if ev.get("event") != "m2.done":
+                              continue
+                          ts = parse_ts(ev.get("ts") or ev.get("created_ts"))
+                          if ts is None:
+                              continue
+                          if best_ts is None or ts > best_ts:
+                              best_ts = ts
+                              best = ev
+              except FileNotFoundError:
+                  continue
+
+          if best and best.get("snapshot_id"):
+              sid = str(best["snapshot_id"])
+              print(f"Using snapshot_id from latest m2.done log (any): {sid}")
+              Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+              return
+
+          # 3) Fallback: latest refresh_report.*.json (prefer match, then most recent)
+          best_path = None
+          best_ts = None
+          paths = glob.glob("outputs/market/refresh_report.*.json")
+          for p in paths:
+              try:
+                  report = json.load(open(p, "r", encoding="utf-8"))
+              except Exception:
+                  continue
+              if norm and report.get("normalized_items_path") != norm:
+                  continue
+              ts = parse_ts(report.get("created_ts"))
+              if ts is None:
+                  continue
+              if best_ts is None or ts > best_ts:
+                  best_ts = ts
+                  best_path = p
+          if not best_path and paths:
+              # no match; pick most recent by mtime
+              best_path = sorted(paths, key=lambda x: os.path.getmtime(x))[-1]
+
+          if best_path:
+              report = json.load(open(best_path, "r", encoding="utf-8"))
+              sid = str(report.get("snapshot_id") or "")
+              if sid:
+                  print(f"Using snapshot_id from refresh_report: {best_path}: {sid}")
+                  Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+                  return
+
+          # 4) Last resort: derive from DB (max snapshot_id present)
+          import sqlite3
+          db_path = "data base/brickovery.db"
+          if not os.path.exists(db_path):
+              raise SystemExit("ERROR: could not resolve snapshot_id (no logs, no refresh_report, and DB missing)")
+
+          con = sqlite3.connect(db_path)
+          cur = con.cursor()
+          sid = None
+          for table in ("market_offers","market_metrics"):
+              try:
+                  row = cur.execute(f"SELECT MAX(snapshot_id) FROM {table}").fetchone()
+                  if row and row[0]:
+                      sid = str(row[0])
+                      break
+              except Exception:
+                  pass
+          con.close()
+          if not sid:
+              raise SystemExit("ERROR: could not resolve snapshot_id from DB")
+          print(f"Using snapshot_id from DB max(snapshot_id): {sid}")
+          Path("snapshot_id.txt").write_text(sid, encoding="utf-8")
+          PY
+
+          SNAPSHOT_ID="$(cat snapshot_id.txt)"
+          echo "snapshot_id=${SNAPSHOT_ID}" >> "$GITHUB_OUTPUT"
+          echo "SNAPSHOT_ID=${SNAPSHOT_ID}" >> "$GITHUB_ENV"
+          echo "Resolved snapshot_id: ${SNAPSHOT_ID}"
+
+      - name: Sanity check (counts for snapshot_id)
+        env:
+          SNAPSHOT_ID: ${{ steps.snap.outputs.snapshot_id }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sqlite3
+          sid = os.environ.get("SNAPSHOT_ID","").strip()
+          db="data base/brickovery.db"
+          con=sqlite3.connect(db)
+          cur=con.cursor()
+          for t in ("market_metrics","market_offers"):
+              try:
+                  n = cur.execute(f"SELECT COUNT(*) FROM {t} WHERE snapshot_id=?", (sid,)).fetchone()[0]
+                  print(f"{t}.rows_for_snapshot={n}")
+              except Exception as e:
+                  print(f"{t}.rows_for_snapshot=ERROR {e}")
+          con.close()
+          PY
+
+      - name: M3 solve seeds
+        env:
+          SNAPSHOT_ID: ${{ steps.snap.outputs.snapshot_id }}
+          NORMALIZED_ITEMS: ${{ steps.norm.outputs.normalized_items }}
+          SCENARIOS: ${{ github.event.inputs.scenarios }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD"
+          mkdir -p outputs/solver
+          python -m brickovery.cli solve --config configs/config.v1.yaml --output-dir outputs/solver --snapshot-id "${SNAPSHOT_ID}" --normalized-items "${NORMALIZED_ITEMS}" --scenarios "${SCENARIOS}"
 
       - name: Show latest solver output
-        working-directory: repo
         run: |
           set -euo pipefail
           ls -la outputs/solver || true
-          latest=$(ls -1 outputs/solver/seed_solutions.*.json 2>/dev/null | sort | tail -n 1 || true)
+          latest="$(ls -t outputs/solver/seed_solutions.*.json | head -n 1 || true)"
+          echo "latest: ${latest}"
           if [ -n "${latest}" ]; then
-            echo "latest: ${latest}"
-            echo "resolved_snapshot_id: ${{ steps.snap.outputs.snapshot_id }}"
-            python -c 'import json,glob; p=sorted(glob.glob("outputs/solver/seed_solutions.*.json"))[-1]; data=json.load(open(p,"r",encoding="utf-8")); print("run_id:",data.get("run_id")); print("snapshot_id:",data.get("snapshot_id")); sc=data.get("scenarios") or []; print("scenarios:",len(sc)); [print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or [])) for s in sc]'
+            python - <<PY
+import json
+p="${latest}"
+data=json.load(open(p,"r",encoding="utf-8"))
+print("run_id:", data.get("run_id"))
+print("snapshot_id:", data.get("snapshot_id"))
+print("normalized_items_path:", data.get("normalized_items_path"))
+sc=data.get("scenarios") or []
+print("scenarios:", len(sc))
+for s in sc:
+    print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or []))
+PY
           fi
 
       - name: Upload solver artifacts
@@ -143,5 +265,5 @@ jobs:
         with:
           name: brickovery-m3-solver
           path: |
-            repo/outputs/solver
-            repo/data base/logs
+            outputs/solver
+            data base/logs
