@@ -38,29 +38,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Preflight - verify inputs/search.xml (and commit is fresh)
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          echo "Repo HEAD: $(git rev-parse HEAD)"
-          echo "Last commit: $(git log -1 --oneline)"
-          echo "Listing inputs/:"
-          ls -la inputs || true
-          if [ ! -f inputs/search.xml ]; then
-            echo "::error::inputs/search.xml not found. Commit it under inputs/search.xml (same branch as the workflow run)."
-            exit 1
-          fi
-          python - <<'PY'
-          import re, hashlib, pathlib
-          p = pathlib.Path('inputs/search.xml')
-          txt = p.read_text(encoding='utf-8', errors='ignore').lstrip('\ufeff')
-          b = txt.encode('utf-8', errors='ignore')
-          print('search.xml bytes:', len(b))
-          print('search.xml sha256:', hashlib.sha256(b).hexdigest())
-          print('<ITEM> tag count:', len(re.findall(r'<\\s*ITEM\\b', txt, flags=re.I)))
-          ids = re.findall(r'<\\s*ITEMID\\s*>\\s*([^<\\s]+)\\s*<\\s*/\\s*ITEMID\\s*>', txt, flags=re.I)
-          print('ITEMID sample:', ids[:10])
-          PY
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -84,21 +61,6 @@ jobs:
           test -f "data base/rarity_rules.txt" || true
           test -f "data base/shipping_normal.txt" || true
           test -f "data base/shipping_registered.txt" || true
-
-      - name: Generate RUN_ID
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          echo "RUN_ID=$RUN_ID"
-
-      - name: Sanity check Python entrypoint
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          python -m py_compile brickovery/cli.py
-          python -m compileall -q brickovery
 
       - name: Normalize input (ensure current search.xml is used)
         working-directory: repo
@@ -128,12 +90,8 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-          # Use RUN_ID generated earlier for consistent log + snapshot IDs.
-          if [ -z "${RUN_ID:-}" ]; then
-            RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-            echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          fi
-          echo "RUN_ID=$RUN_ID"
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
           EXTRA_ARGS=""
           if [ "${{ inputs.force_refresh }}" = "true" ]; then EXTRA_ARGS="--force"; fi
           python -m brickovery.cli refresh-cache --config configs/config.v1.yaml ${EXTRA_ARGS}
@@ -153,73 +111,13 @@ jobs:
           report = json.load(open(rp,"r",encoding="utf-8"))
           errors = int(report.get("errors", 0))
           refreshed = int(report.get("refreshed_items", 0))
-          cache_hits = int(report.get("cache_hits", report.get("skipped_items", 0)))
+          skipped = int(report.get("skipped_items", 0))
           print(f"refresh_report: {rp}")
-          print(f"errors={errors} refreshed_items={refreshed} cache_hits={cache_hits}")
+          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
           if errors > 0:
               sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
           PY
 
-
-
-
-      - name: Compute pinned snapshot_id (avoid empty snapshots on TTL hits)
-        if: always()
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, glob, os
-
-          paths = sorted(glob.glob('outputs/market/refresh_report.*.json'))
-          if not paths:
-              raise SystemExit('No outputs/market/refresh_report.*.json found')
-
-          def snap(r):
-              return r.get('effective_snapshot_id') or r.get('snapshot_id') or r.get('run_id') or ''
-
-          latest = paths[-1]
-          rep = json.load(open(latest, 'r', encoding='utf-8'))
-          latest_snap = snap(rep)
-          refreshed = int(rep.get('refreshed_items', 0))
-          errors = int(rep.get('errors', 0))
-
-          pinned = latest_snap
-          if errors == 0 and refreshed == 0:
-              for pp in reversed(paths[:-1]):
-                  r = json.load(open(pp, 'r', encoding='utf-8'))
-                  if int(r.get('errors', 0)) == 0 and int(r.get('refreshed_items', 0)) > 0:
-                      pinned = snap(r)
-                      break
-
-          os.makedirs('outputs/market', exist_ok=True)
-          meta = {
-              'latest_report': latest,
-              'latest_snapshot_id': latest_snap,
-              'pinned_snapshot_id': pinned,
-              'latest_refreshed_items': int(rep.get('refreshed_items', 0)),
-              'latest_cache_hits': int(rep.get('cache_hits', rep.get('skipped_items', 0))),
-              'latest_skipped_items': int(rep.get('skipped_items', 0)),  # backward-compat
-
-              'latest_errors': int(rep.get('errors', 0)),
-          }
-
-          with open('outputs/market/pinned_snapshot.json', 'w', encoding='utf-8') as f:
-              json.dump(meta, f, indent=2)
-              f.write('\n')
-          with open('outputs/market/pinned_snapshot_id.txt', 'w', encoding='utf-8') as f:
-              f.write(pinned + '\n')
-
-          # Export for later steps
-          env_path = os.environ.get('GITHUB_ENV')
-          if env_path:
-              with open(env_path, 'a', encoding='utf-8') as f:
-                  f.write(f"M2_SNAPSHOT_ID={latest_snap}\n")
-                  f.write(f"PINNED_SNAPSHOT_ID={pinned}\n")
-
-          print('Pinned snapshot computed:')
-          print(meta)
-          PY
 
       - name: DB gate (market tables sanity)
         if: always()
@@ -384,51 +282,27 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-
-          # Prefer the snapshot_id from the latest refresh_report, because the CLI may generate its own run_id.
-          RID="$(ls -1t outputs/market/refresh_report.*.json 2>/dev/null | head -n 1 | xargs -r jq -r '.snapshot_id // .run_id // empty' || true)"
-          if [ -z "$RID" ]; then RID="${RUN_ID:-}"; fi
+          # Prefer the RUN_ID we generated above (timestamp). If not present, fall back to newest run-* dir.
+          RID="${RUN_ID:-}"
           LOG_ROOT="data base/logs"
-          PREFERRED=""
-          TARGET_DIR=""
 
-          if [ -n "$RID" ] && [ -d "$LOG_ROOT/run-$RID" ]; then
-            PREFERRED="$LOG_ROOT/run-$RID"
-          fi
-
-          if [ -n "$PREFERRED" ]; then
-            if find "$PREFERRED" -type f -name "slice-*.jsonl" -print -quit | grep -q .; then
-              TARGET_DIR="$PREFERRED"
-            else
-              echo "Preferred log dir exists but has no slice-*.jsonl: $PREFERRED"
-              echo "Listing preferred dir:"
-              find "$PREFERRED" -maxdepth 3 -type f -print || true
-            fi
-          fi
-
-          if [ -z "$TARGET_DIR" ]; then
-            # Pick newest run-* directory that contains at least one slice file
-            TARGET_DIR="$(for d in "$LOG_ROOT"/run-*; do
-              [ -d "$d" ] || continue
-              if find "$d" -type f -name "slice-*.jsonl" -print -quit | grep -q .; then
-                echo "$d"
-              fi
-            done | sort | tail -n 1 || true)"
+          if [ -n "$RID" ] && [ -d "${LOG_ROOT}/run-${RID}" ]; then
+            TARGET_DIR="${LOG_ROOT}/run-${RID}"
+          else
+            TARGET_DIR="$(ls -1d "${LOG_ROOT}"/run-* 2>/dev/null | sort | tail -n 1 || true)"
           fi
 
           echo "TARGET_LOG_DIR=${TARGET_DIR}"
           if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
-            echo "No usable log dir found under: $LOG_ROOT"
-            echo "Listing any slice files that exist:"
-            find "$LOG_ROOT" -maxdepth 4 -type f -name "slice-*.jsonl" -print || true
+            echo "No log dir found. Listing available logs:"
+            find "$LOG_ROOT" -maxdepth 3 -type f -name "slice-*.jsonl" -print || true
             exit 0
           fi
 
           mapfile -d '' files < <(find "$TARGET_DIR" -type f -name "slice-*.jsonl" -print0 | sort -z)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No slice-*.jsonl found under: $TARGET_DIR"
-            echo "Listing any slice files that exist under LOG_ROOT:"
-            find "$LOG_ROOT" -maxdepth 4 -type f -name "slice-*.jsonl" -print || true
+            find "$TARGET_DIR" -maxdepth 3 -type f -print || true
             exit 0
           fi
 
