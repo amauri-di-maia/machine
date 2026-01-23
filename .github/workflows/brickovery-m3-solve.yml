@@ -250,21 +250,25 @@ jobs:
         run: |
           set -euo pipefail
           ls -la outputs/solver || true
-          latest="$(ls -t outputs/solver/seed_solutions.*.json | head -n 1 || true)"
+          latest="$(ls -t outputs/solver/seed_solutions.*.json 2>/dev/null | head -n 1 || true)"
           echo "latest: ${latest}"
           if [ -n "${latest}" ]; then
-            python - <<PY
-import json
-p="${latest}"
-data=json.load(open(p,"r",encoding="utf-8"))
-print("run_id:", data.get("run_id"))
-print("snapshot_id:", data.get("snapshot_id"))
-print("normalized_items_path:", data.get("normalized_items_path"))
-sc=data.get("scenarios") or []
-print("scenarios:", len(sc))
-for s in sc:
-    print("-", s.get("scenario"), "score:", (s.get("costs") or {}).get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(s.get("missing_items") or []))
-PY
+            export LATEST_JSON="${latest}"
+            python - <<'PY'
+          import json, os
+          p = os.environ["LATEST_JSON"]
+          with open(p, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          print("run_id:", data.get("run_id"))
+          print("snapshot_id:", data.get("snapshot_id"))
+          print("normalized_items_path:", data.get("normalized_items_path"))
+          sc = data.get("scenarios") or []
+          print("scenarios:", len(sc))
+          for s in sc:
+              costs = s.get("costs") or {}
+              missing = s.get("missing_items") or []
+              print("-", s.get("scenario"), "score:", costs.get("total_score_eur"), "stores:", s.get("n_stores_used"), "missing:", len(missing))
+          PY
           fi
 
       - name: Upload solver artifacts
