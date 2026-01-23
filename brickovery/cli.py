@@ -6,7 +6,22 @@ import json
 import os
 import re
 import time
-import math
+impo
+
+pending_path = None
+if pending_upserts:
+    up_dir = out_dir.parent / "upstream"
+    up_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = up_dir / f"upstream_pending_upserts.{run_id}.json"
+    payload = {
+        "run_id": run_id,
+        "created_ts": now_iso_z(),
+        "count": len(pending_upserts),
+        "items": list(pending_upserts.values()),
+    }
+    pending_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+rt math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -447,6 +462,40 @@ def _lookup_mapping(con, item: _RawItem) -> Tuple[Optional[str], Optional[int], 
     return None, None, "missing"
 
 
+
+
+def _upstream_key_exists(con: sqlite3.Connection, item: Any) -> bool:
+    """True if the upstream mirror has a row for (bl_itemtype, bl_part_id, bl_color_id).
+
+    Accepts either a dict-like item (keys: item_type/item_id/color_id) or a SearchItem.
+    BL uses color_id=0 for 'no color / not applicable'. We treat None as 0 earlier in parsing.
+    """
+    def _get(k: str, default=None):
+        if isinstance(item, dict):
+            return item.get(k, default)
+        return getattr(item, k, default)
+
+    bl_itemtype = (str(_get("item_type") or _get("bl_itemtype") or "")).strip()
+    bl_part_id = (str(_get("item_id") or _get("bl_part_id") or "")).strip()
+    bl_color_id = _get("color_id", None)
+    if bl_color_id is None:
+        bl_color_id = _get("bl_color_id", 0)
+    try:
+        bl_color_id = int(bl_color_id) if bl_color_id is not None else 0
+    except Exception:
+        bl_color_id = 0
+
+    row = con.execute(
+        """
+        SELECT 1
+        FROM up_mapping_mirror
+        WHERE bl_itemtype=? AND bl_part_id=? AND bl_color_id=?
+        LIMIT 1
+        """,
+        (bl_itemtype, bl_part_id, bl_color_id),
+    ).fetchone()
+    return row is not None
+
 def _ensure_fill_later(con, item: _RawItem, reason: str) -> None:
     now = utc_now_iso()
     con.execute(
@@ -496,7 +545,11 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "weight_ok": 0,
             "missing_weight": 0,
             "overrides_created": 0,
+            "missing_upstream_row": 0,
+            "pending_upserts": 0,
         }
+        pending_upserts: Dict[str, Dict[str, Any]] = {}
+
 
         normalized: List[Dict[str, Any]] = []
         total_weight_mg = 0
@@ -508,6 +561,22 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                 stats["mapped_ok"] += 1
             else:
                 stats["missing_boid"] += 1
+
+                # Distinguish: (a) key exists in upstream but boid is missing, vs (b) key does not exist in upstream at all.
+                # We never skip; we record a pending upstream upsert for (b) to be resolved via APIs / upstream DB build flow.
+                if not _upstream_key_exists(con, it):
+                    stats["missing_upstream_row"] += 1
+                    k = f"{it.bl_itemtype}:{it.bl_part_id}:{it.bl_color_id}"
+                    if k not in pending_upserts:
+                        pending_upserts[k] = {
+                            "bl_itemtype": it.bl_itemtype,
+                            "bl_part_id": it.bl_part_id,
+                            "bl_color_id": it.bl_color_id,
+                            "condition": it.condition,
+                            "qty": it.qty,
+                            "reason": "missing upstream row for key",
+                        }
+
                 _ensure_fill_later(con, it, reason="missing boid in upstream/override")
                 stats["overrides_created"] += 1
 
@@ -529,6 +598,9 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                     "mapping_source": source,
                 }
             )
+
+
+stats["pending_upserts"] = len(pending_upserts)
 
         up_state = _get_upstream_state(con)
         con.commit()
