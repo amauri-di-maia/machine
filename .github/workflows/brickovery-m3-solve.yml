@@ -7,10 +7,6 @@ on:
         description: "Optional: force snapshot_id (otherwise auto-resolve latest matching current normalized_items)"
         required: false
         default: ""
-      scenarios:
-        description: "Number of scenarios to output"
-        required: false
-        default: "5"
 
 concurrency:
   group: brickovery-m3-solve
@@ -239,12 +235,11 @@ jobs:
         env:
           SNAPSHOT_ID: ${{ steps.snap.outputs.snapshot_id }}
           NORMALIZED_ITEMS: ${{ steps.norm.outputs.normalized_items }}
-          SCENARIOS: ${{ github.event.inputs.scenarios }}
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
           mkdir -p outputs/solver
-          python -m brickovery.cli solve --config configs/config.v1.yaml --output-dir outputs/solver --snapshot-id "${SNAPSHOT_ID}" --normalized-items "${NORMALIZED_ITEMS}" --scenarios "${SCENARIOS}"
+          python -m brickovery.cli solve --config configs/config.v1.yaml --output-dir outputs/solver --snapshot-id "${SNAPSHOT_ID}" --normalized-items "${NORMALIZED_ITEMS}"
 
       - name: Show latest solver output
         run: |
