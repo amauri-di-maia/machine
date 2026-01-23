@@ -130,9 +130,9 @@ jobs:
           report = json.load(open(rp,"r",encoding="utf-8"))
           errors = int(report.get("errors", 0))
           refreshed = int(report.get("refreshed_items", 0))
-          skipped = int(report.get("skipped_items", 0))
+          cache_hits = int(report.get("cache_hits", report.get("skipped_items", 0)))
           print(f"refresh_report: {rp}")
-          print(f"errors={errors} refreshed_items={refreshed} skipped_items={skipped}")
+          print(f"errors={errors} refreshed_items={refreshed} cache_hits={cache_hits}")
           if errors > 0:
               sys.exit(f"ERROR: M2 refresh-cache reported errors={errors}")
           PY
@@ -175,7 +175,9 @@ jobs:
               'latest_snapshot_id': latest_snap,
               'pinned_snapshot_id': pinned,
               'latest_refreshed_items': int(rep.get('refreshed_items', 0)),
-              'latest_skipped_items': int(rep.get('skipped_items', 0)),
+              'latest_cache_hits': int(rep.get('cache_hits', rep.get('skipped_items', 0))),
+              'latest_skipped_items': int(rep.get('skipped_items', 0)),  # backward-compat
+
               'latest_errors': int(rep.get('errors', 0)),
           }
 
