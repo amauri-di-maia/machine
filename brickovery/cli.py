@@ -1,4 +1,3 @@
-
 import argparse
 import glob
 import json
@@ -519,7 +518,19 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         migrate(con)
         _ensure_m1_tables(con)
 
+        
         raw = _parse_search_xml(args.input)
+        # Debug/audit: confirm we are reading the expected search.xml content
+        try:
+            _raw_txt = _read_text(args.input) or ""
+            _item_tag_count = len(re.findall(r"<\s*ITEM\b", _raw_txt, flags=re.IGNORECASE))
+            _bytes = len(_raw_txt.encode("utf-8", errors="ignore"))
+            _first = [{"itemtype": r.bl_itemtype, "itemid": r.bl_part_id, "color": r.bl_color_id, "qty": r.qty, "cond": r.condition} for r in raw[:5]]
+            logger.log("m1.parse_search_xml.stats", input_path=args.input, file_bytes=_bytes, item_tag_count=_item_tag_count, parsed_items=len(raw), first_items=_first)
+            if _item_tag_count and len(raw) == 1 and _item_tag_count > 1:
+                logger.log("m1.warn", msg="Parsed only 1 ITEM but search.xml contains multiple <ITEM> tags. Check that the workflow is reading the right file and that inputs/search.xml was committed to the same branch.", input_sha256=_sha256_file(args.input), item_tag_count=_item_tag_count)
+        except Exception as _e:
+            logger.log("m1.warn", msg=f"Failed to compute search.xml debug stats: {_e.__class__.__name__}: {_e}")
         requested = _aggregate_items(raw)
 
 
