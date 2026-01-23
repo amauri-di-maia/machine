@@ -16,13 +16,17 @@ on:
         required: false
         default: "2.50"
       mode:
-        description: "Solver mode (use: normal). Note: 'both' is NOT supported."
+        description: "Mode (normal only for now)"
         required: false
         default: "normal"
+        type: choice
+        options: ["normal"]
       shipping_method:
-        description: "Report focus: both | normal | registered (does not change solve; filters summary only)"
+        description: "Filter summary by shipping method"
         required: false
         default: "both"
+        type: choice
+        options: ["both", "normal", "registered"]
 
 concurrency:
   group: brickovery-m3
@@ -34,150 +38,131 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (minimal)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install pydantic PyYAML beautifulsoup4 requests
 
-      - name: Normalize input (M1 inside M3)
-        run: |
-          set -euo pipefail
-          export PYTHONPATH="$PWD"
-          mkdir -p outputs/inputs
-          python -m brickovery.cli normalize-input             --config configs/config.v1.yaml             --input inputs/search.xml             --output-dir outputs/inputs
-
-      - name: Resolve snapshot_id (from DB, latest)
+      - name: Resolve snapshot_id from latest refresh_report (authoritative)
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, sqlite3, sys
+          import glob, json, os, sys
+          from datetime import datetime
 
-          db_path = os.path.join("data base", "brickovery.db")
-          if not os.path.exists(db_path):
-            print(f"ERROR: DB not found: {db_path}")
-            print("Action: run M2 refresh-cache first (it populates the DB).")
+          rr_paths = sorted(glob.glob("outputs/market/refresh_report.*.json"))
+          if not rr_paths:
+            print("ERROR: No outputs/market/refresh_report.*.json found in repo.")
+            print("Action: run M2 refresh-cache with commit_push=true (so reports are committed), then rerun M3.")
             sys.exit(1)
 
-          con = sqlite3.connect(db_path)
-          con.row_factory = sqlite3.Row
-
-          def cols(table):
-            return [r["name"] for r in con.execute(f"PRAGMA table_info('{table}')")]
-
-          def find_col(table, candidates):
-            c = set(cols(table))
-            for name in candidates:
-              if name in c:
-                return name
-            return None
-
-          def latest_snapshot_from(table):
+          def parse_dt(p):
             try:
-              c = cols(table)
+              r = json.load(open(p,"r",encoding="utf-8"))
+            except Exception:
+              return (datetime.min, None)
+            ts = r.get("created_ts") or r.get("ts") or ""
+            try:
+              dt = datetime.fromisoformat(ts.replace("Z","+00:00"))
+            except Exception:
+              dt = datetime.min
+            return (dt, r)
+
+          best = None
+          for p in rr_paths:
+            dt, r = parse_dt(p)
+            if r is None: 
+              continue
+            if best is None or (dt, p) > (best[0], best[1]):
+              best = (dt, p, r)
+
+          if best is None:
+            print("ERROR: Could not parse any refresh_report.*.json")
+            sys.exit(1)
+
+          _, best_path, report = best
+          snapshot_id = report.get("snapshot_id") or report.get("run_id")
+          if not snapshot_id:
+            print(f"ERROR: refresh_report has no snapshot_id/run_id: {best_path}")
+            sys.exit(1)
+
+          norm_path = report.get("normalized_items_path") or ""
+          print(f"Using refresh_report={best_path}")
+          print(f"Using snapshot_id={snapshot_id}")
+          if norm_path:
+            print(f"Report normalized_items_path={norm_path}")
+
+          # Export to env for next steps
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+            f.write(f"SNAPSHOT_ID={snapshot_id}\n")
+            f.write(f"REFRESH_REPORT_PATH={best_path}\n")
+            if norm_path:
+              f.write(f"NORMALIZED_ITEMS_PATH={norm_path}\n")
+          PY
+
+      - name: DB gate (confirm M2 data is present in repo DB)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3, os
+          db = os.path.join("data base","brickovery.db")
+          con = sqlite3.connect(db)
+          con.row_factory = sqlite3.Row
+          def count(t):
+            try:
+              return con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
             except Exception:
               return None
-            snap_col = find_col(table, ["snapshot_id", "run_id", "snapshot"])
-            ts_col = find_col(table, ["ingested_ts", "created_ts", "ts", "updated_ts"])
-            if not snap_col or not ts_col:
-              return None
-            q = f"""SELECT {snap_col} AS sid, MAX({ts_col}) AS mx
-                    FROM {table}
-                    WHERE {snap_col} IS NOT NULL
-                    GROUP BY {snap_col}
-                    ORDER BY mx DESC
-                    LIMIT 1"""
-            row = con.execute(q).fetchone()
-            if not row:
-              return None
-            return (row["sid"], row["mx"], table, snap_col, ts_col)
-
-          got = latest_snapshot_from("market_offers") or latest_snapshot_from("market_metrics")
-          if not got:
-            print("ERROR: Could not resolve snapshot_id from DB tables market_offers/market_metrics.")
-            print("Action: run M2 refresh-cache (preferably once with --force after changing search.xml).")
-            sys.exit(1)
-
-          sid, mx, table, snap_col, ts_col = got
-          print(f"Using snapshot_id={sid} (table={table}, {ts_col} max={mx})")
-
-          # export
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-            f.write(f"SNAPSHOT_ID={sid}\n")
+          offers = count("market_offers")
+          metrics = count("market_metrics")
+          print(f"market_offers.rows={offers}")
+          print(f"market_metrics.rows={metrics}")
+          if offers in (None, 0) or metrics in (None, 0):
+            raise SystemExit("ERROR: DB gate failed. This usually means M2 did not commit/push DB changes to the repo.")
           PY
 
       - name: Solve (M3)
         run: |
           set -euo pipefail
           export PYTHONPATH="$PWD"
-
-          MODE="${{ github.event.inputs.mode }}"
-          if [ "$MODE" = "both" ]; then
-            echo "WARN: --mode 'both' is not supported by the CLI; using 'normal'."
-            MODE="normal"
-          fi
-
           mkdir -p outputs/solve/checkpoints
-          python -m brickovery.cli solve             --config configs/config.v1.yaml             --snapshot-id "${SNAPSHOT_ID}"             --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}"             --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}"             --penalty-store "${{ github.event.inputs.penalty_store }}"             --mode "${MODE}"             --output "outputs/solve/seed_solutions.${{ github.run_id }}.json"
+          python -m brickovery.cli solve             --config configs/config.v1.yaml             --snapshot-id "${SNAPSHOT_ID}"             --time-budget-minutes "${{ github.event.inputs.time_budget_minutes }}"             --checkpoint-every-seconds "${{ github.event.inputs.checkpoint_every_seconds }}"             --penalty-store "${{ github.event.inputs.penalty_store }}"             --mode "${{ github.event.inputs.mode }}"             --output outputs/solve/seed_solutions.${{ github.run_id }}.json
 
-      - name: Summary (filtered by shipping_method)
+      - name: Show summary (filter by shipping method)
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json, os, glob
-
-          focus = os.environ.get("FOCUS", "both").strip().lower()
+          import glob, json, os, sys
+          ship = os.environ.get("SHIP_FILTER","both")
           paths = sorted(glob.glob("outputs/solve/seed_solutions.*.json"))
           if not paths:
-            print("No seed_solutions.*.json found.")
-            raise SystemExit(0)
-          p = paths[-1]
-          with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-          # expected: data has "scenarios" or is list; print robustly
-          scenarios = data.get("scenarios") if isinstance(data, dict) else None
-          if scenarios is None and isinstance(data, dict):
-            # try common alternative keys
-            for k in ("solutions","seed_solutions","results"):
-              if k in data:
-                scenarios = data[k]
-                break
-          if scenarios is None:
-            scenarios = data if isinstance(data, list) else []
-
-          def keep(name):
-            n = str(name).lower()
-            if focus == "both":
-              return True
-            if focus == "normal":
-              return n.endswith("_normal") or "_normal" in n
-            if focus == "registered":
-              return n.endswith("_registered") or "_registered" in n
-            return True
-
-          print(f"seed_file={p}")
-          print(f"shipping_method_focus={focus}")
-          kept = 0
-          for s in scenarios:
-            if isinstance(s, dict):
-              name = s.get("name") or s.get("scenario") or "scenario"
-              if keep(name):
-                kept += 1
-                print(f"- {name} score={s.get('score')} stores={s.get('stores')} missing={s.get('missing')}")
-          if kept == 0:
-            print("(no scenarios matched the focus; showing raw top-level keys)")
-            if isinstance(data, dict):
-              print(list(data.keys()))
+            print("No seed_solutions.*.json found")
+            sys.exit(0)
+          data = json.load(open(paths[-1],"r",encoding="utf-8"))
+          print(f"run_id: {data.get('run_id')}")
+          print(f"snapshot_id: {data.get('snapshot_id')}")
+          print(f"normalized_items_path: {data.get('normalized_items_path')}")
+          scenarios = data.get("scenarios", [])
+          def keep(s):
+            if ship == "both": return True
+            name = (s.get("name") or "").lower()
+            return ship in name
+          kept = [s for s in scenarios if keep(s)]
+          print(f"scenarios_total: {len(scenarios)} kept: {len(kept)} ship_filter={ship}")
+          for s in kept:
+            print(f"- {s.get('name')} score: {s.get('score_total')} stores: {s.get('n_stores_used')} missing: {len(s.get('missing_items',[]))}")
           PY
         env:
-          FOCUS: "${{ github.event.inputs.shipping_method }}"
+          SHIP_FILTER: ${{ github.event.inputs.shipping_method }}
 
       - name: Upload solve outputs
         uses: actions/upload-artifact@v4
@@ -185,4 +170,5 @@ jobs:
           name: brickovery-m3-outputs-${{ github.run_id }}
           path: |
             outputs/solve/**
+            outputs/market/**
             outputs/inputs/**
