@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import glob
 import json
@@ -5,7 +7,6 @@ import os
 import re
 import time
 import math
-import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -446,40 +447,6 @@ def _lookup_mapping(con, item: _RawItem) -> Tuple[Optional[str], Optional[int], 
     return None, None, "missing"
 
 
-
-
-def _upstream_key_exists(con: sqlite3.Connection, item: Any) -> bool:
-    """True if the upstream mirror has a row for (bl_itemtype, bl_part_id, bl_color_id).
-
-    Accepts either a dict-like item (keys: item_type/item_id/color_id) or a SearchItem.
-    BL uses color_id=0 for 'no color / not applicable'. We treat None as 0 earlier in parsing.
-    """
-    def _get(k: str, default=None):
-        if isinstance(item, dict):
-            return item.get(k, default)
-        return getattr(item, k, default)
-
-    bl_itemtype = (str(_get("item_type") or _get("bl_itemtype") or "")).strip()
-    bl_part_id = (str(_get("item_id") or _get("bl_part_id") or "")).strip()
-    bl_color_id = _get("color_id", None)
-    if bl_color_id is None:
-        bl_color_id = _get("bl_color_id", 0)
-    try:
-        bl_color_id = int(bl_color_id) if bl_color_id is not None else 0
-    except Exception:
-        bl_color_id = 0
-
-    row = con.execute(
-        """
-        SELECT 1
-        FROM up_mapping_mirror
-        WHERE bl_itemtype=? AND bl_part_id=? AND bl_color_id=?
-        LIMIT 1
-        """,
-        (bl_itemtype, bl_part_id, bl_color_id),
-    ).fetchone()
-    return row is not None
-
 def _ensure_fill_later(con, item: _RawItem, reason: str) -> None:
     now = utc_now_iso()
     con.execute(
@@ -518,39 +485,8 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
         migrate(con)
         _ensure_m1_tables(con)
 
-        
         raw = _parse_search_xml(args.input)
-        # Debug/audit: confirm we are reading the expected search.xml content
-        try:
-            _raw_txt = _read_text(args.input) or ""
-            _item_tag_count = len(re.findall(r"<\s*ITEM\b", _raw_txt, flags=re.IGNORECASE))
-            _bytes = len(_raw_txt.encode("utf-8", errors="ignore"))
-            _first = [{"itemtype": r.bl_itemtype, "itemid": r.bl_part_id, "color": r.bl_color_id, "qty": r.qty, "cond": r.condition} for r in raw[:5]]
-            logger.log("m1.parse_search_xml.stats", input_path=args.input, file_bytes=_bytes, item_tag_count=_item_tag_count, parsed_items=len(raw), first_items=_first)
-            if _item_tag_count and len(raw) == 1 and _item_tag_count > 1:
-                logger.log("m1.warn", msg="Parsed only 1 ITEM but search.xml contains multiple <ITEM> tags. Check that the workflow is reading the right file and that inputs/search.xml was committed to the same branch.", input_sha256=_sha256_file(args.input), item_tag_count=_item_tag_count)
-        except Exception as _e:
-            logger.log("m1.warn", msg=f"Failed to compute search.xml debug stats: {_e.__class__.__name__}: {_e}")
         requested = _aggregate_items(raw)
-
-
-        # Normalize BrickLink color semantics:
-        # - If COLOR is missing/blank and item type is "no-color" (anything other than P/Part), set bl_color_id=0.
-        # - If COLOR is missing for Parts (P), we cannot infer safely -> fail fast with a clear error.
-        requested_norm: List[_RawItem] = []
-        for it in requested:
-            if it.bl_color_id is None:
-                if it.bl_itemtype.upper() != "P":
-                    requested_norm.append(_RawItem(it.bl_itemtype, it.bl_part_id, 0, it.qty, it.condition))
-                else:
-                    raise ValueError(
-                        f"Missing COLOR for BrickLink item type 'P' (Part). "
-                        f"ITEMID={it.bl_part_id}. Fix inputs/search.xml (COLOR tag) to avoid buying wrong parts."
-                    )
-            else:
-                requested_norm.append(it)
-        requested = requested_norm
-
 
         stats = {
             "raw_items": len(raw),
@@ -560,11 +496,7 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
             "weight_ok": 0,
             "missing_weight": 0,
             "overrides_created": 0,
-            "missing_upstream_row": 0,
-            "pending_upserts": 0,
         }
-        pending_upserts: Dict[str, Dict[str, Any]] = {}
-
 
         normalized: List[Dict[str, Any]] = []
         total_weight_mg = 0
@@ -576,22 +508,6 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                 stats["mapped_ok"] += 1
             else:
                 stats["missing_boid"] += 1
-
-                # Distinguish: (a) key exists in upstream but boid is missing, vs (b) key does not exist in upstream at all.
-                # We never skip; we record a pending upstream upsert for (b) to be resolved via APIs / upstream DB build flow.
-                if not _upstream_key_exists(con, it):
-                    stats["missing_upstream_row"] += 1
-                    k = f"{it.bl_itemtype}:{it.bl_part_id}:{it.bl_color_id}"
-                    if k not in pending_upserts:
-                        pending_upserts[k] = {
-                            "bl_itemtype": it.bl_itemtype,
-                            "bl_part_id": it.bl_part_id,
-                            "bl_color_id": it.bl_color_id,
-                            "condition": it.condition,
-                            "qty": it.qty,
-                            "reason": "missing upstream row for key",
-                        }
-
                 _ensure_fill_later(con, it, reason="missing boid in upstream/override")
                 stats["overrides_created"] += 1
 
@@ -613,29 +529,6 @@ def cmd_normalize_input(args: argparse.Namespace) -> int:
                     "mapping_source": source,
                 }
             )
-
-
-        stats["pending_upserts"] = len(pending_upserts)
-
-        # Write pending upstream upserts buffer (audit trail; does NOT modify upstream repo)
-        pending_path = None
-        pending_sha256 = None
-        if pending_upserts:
-            up_dir = (out_dir.parent / "upstream")
-            up_dir.mkdir(parents=True, exist_ok=True)
-            pending_path = up_dir / f"upstream_pending_upserts.{run_id}.json"
-            payload = {
-                "run_id": run_id,
-                "created_ts": created_ts,
-                "input_path": str(input_path),
-                "input_sha256": sha256_file(str(input_path)),
-                "upstream_repo": upstream_repo,
-                "upstream_ref": upstream_ref,
-                "upstream_commit_sha": upstream_commit_sha,
-                "items": pending_upserts,
-            }
-            pending_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            pending_sha256 = sha256_file(str(pending_path))
 
         up_state = _get_upstream_state(con)
         con.commit()
@@ -1164,56 +1057,21 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 return False
 
         refreshed = 0
-        cache_hits = 0  # TTL hit: refresh skipped (item still fully participates downstream)
+        skipped = 0
         errors = 0
-        per_item = []  # audit trail
 
         for it in items:
             itype = it["bl_itemtype"]
             pid = it["bl_part_id"]
-
             cid = it.get("bl_color_id")
             if cid is None:
-                # No silent skipping: allow only when color truly does not apply (non-Part item types -> 0).
-                if str(itype).upper() != "P":
-                    cid = 0
-                else:
-                    errors += 1
-                    logger.log("m2.error", item_key=f"BL:{itype} {pid}", reason="missing_bl_color_id")
-                    continue
+                skipped += 1
+                continue
             cid = int(cid)
 
-            last_n = _last_ts(itype, pid, cid, "N")
-            last_u = _last_ts(itype, pid, cid, "U")
-            fresh_n = _fresh(last_n)
-            fresh_u = _fresh(last_u)
-
-            if not args.force and fresh_n and fresh_u:
-                cache_hits += 1
-                per_item.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": cid,
-                    "decision": "cache_hit",
-                    "reason": "ttl_fresh_both_conditions",
-                    "last_fetched_ts_N": last_n,
-                    "last_fetched_ts_U": last_u,
-                    "ttl_hours": ttl_hours,
-                })
-                logger.log("m2.item.cache_hit", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, ttl_hours=ttl_hours, last_fetched_ts_N=last_n, last_fetched_ts_U=last_u)
+            if not args.force and _fresh(_last_ts(itype, pid, cid, "N")) and _fresh(_last_ts(itype, pid, cid, "U")):
+                skipped += 1
                 continue
-
-            per_item.append({
-                "bl_itemtype": itype,
-                "bl_part_id": pid,
-                "bl_color_id": cid,
-                "decision": "refresh",
-                "reason": "force" if args.force else "ttl_stale_or_missing",
-                "last_fetched_ts_N": last_n,
-                "last_fetched_ts_U": last_u,
-                "ttl_hours": ttl_hours,
-            })
-            logger.log("m2.item.refresh", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, force=bool(args.force), ttl_hours=ttl_hours, last_fetched_ts_N=last_n, last_fetched_ts_U=last_u)
 
             try:
                 html_cat = _fetch(session, url_catalog, params={itype.upper(): pid}, headers=headers, timeout_s=args.timeout_s, max_tries=args.max_tries, delay_s=0.0)
@@ -1292,13 +1150,6 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
                 refreshed += 1
             except Exception as e:
                 errors += 1
-                per_item.append({
-                    "bl_itemtype": itype,
-                    "bl_part_id": pid,
-                    "bl_color_id": cid,
-                    "decision": "error",
-                    "error": str(e),
-                })
                 logger.log("m2.error", bl_itemtype=itype, bl_part_id=pid, bl_color_id=cid, error=str(e))
 
         con.commit()
@@ -1313,8 +1164,7 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "created_ts": fetched_ts,
             "ttl_hours": ttl_hours,
             "refreshed_items": refreshed,
-            "cache_hits": cache_hits,
-            "skipped_items": cache_hits,  # backward-compat alias; means TTL cache hit (not "skipping items")
+            "skipped_items": skipped,
             "errors": errors,
             "normalized_items_path": norm_path,
             "cookie_env_var": args.cookie_env_var,
@@ -1322,7 +1172,6 @@ def cmd_refresh_cache(args: argparse.Namespace) -> int:
             "data_source": data_source,
         }
         _write_json(str(out_dir / f"refresh_report.{run_id}.json"), report)
-        _write_json(str(out_dir / f"refresh_items.{run_id}.json"), {"items": per_item})
         logger.log("m2.done", **report)
 
         return 0
@@ -1481,9 +1330,9 @@ def cmd_solve(args: argparse.Namespace) -> int:
         if getattr(cfg.github_sync, "enabled", True) and not args.no_pull:
             sync_repo(
                 repo_root=cfg.paths.repo_root,
-                do_pull=getattr(cfg.github_sync, "pull", True),
-                do_commit=False,
-                do_push=False,
+                pull=getattr(cfg.github_sync, "pull", True),
+                commit=False,
+                push=False,
                 git_user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
                 git_user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
                 logger=logger,
@@ -1873,9 +1722,9 @@ def cmd_solve(args: argparse.Namespace) -> int:
         if getattr(cfg.github_sync, "enabled", True) and not args.no_commit:
             sync_repo(
                 repo_root=cfg.paths.repo_root,
-                do_pull=False,
-                do_commit=not args.no_commit,
-                do_push=not args.no_push,
+                pull=False,
+                commit=not args.no_commit,
+                push=not args.no_push,
                 git_user_name=getattr(cfg.github_sync, "git_user_name", "github-actions[bot]"),
                 git_user_email=getattr(cfg.github_sync, "git_user_email", "41898282+github-actions[bot]@users.noreply.github.com"),
                 logger=logger,
